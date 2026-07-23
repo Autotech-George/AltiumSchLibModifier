@@ -1,0 +1,6 @@
+# Runtime dependencies for altium_schlib
+olefile>=0.46          # read OLE2/CFBF compound files (the SchLib container)
+pywin32>=305 ; platform_system == "Windows"   # native Structured Storage writer (save/edit)
+
+# Development / testing
+pytest>=7.0

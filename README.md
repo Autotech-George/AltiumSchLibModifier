@@ -1,0 +1,148 @@
+# AltiumSchLibModifier
+
+A Python tool to **read and edit Altium schematic library (`.SchLib`) files** —
+the binary libraries that hold schematic symbol/component definitions.
+
+It parses the container and the per-component record streams, lets you inspect
+and modify component data in memory, and writes a valid `.SchLib` back out
+losslessly (only the bytes you actually changed change).
+
+## Status
+
+- ✅ Parse the compound-file container and enumerate all components
+- ✅ Byte-exact round-trip of every component's record stream (verified on 714/714)
+- ✅ Resolve component names ↔ OLE storage names (handles truncation & sanitization)
+- ✅ Edit component header fields / parameters in memory
+- ✅ Save to a new `.SchLib` preserving structure and Altium's CLSID
+
+## Requirements
+
+- Python 3.10+
+- [`olefile`](https://pypi.org/project/olefile/) — reads the compound file
+- [`pywin32`](https://pypi.org/project/pywin32/) — **Windows only**, used by the
+  writer to create the compound file via native Structured Storage. Reading and
+  parsing work cross-platform; saving currently requires Windows.
+
+```bash
+pip install -r requirements.txt
+```
+
+## Quick start
+
+Run the acceptance/test program against the sample library in `input/`:
+
+```bash
+python list_components.py
+```
+
+It prints the library metadata, lists components, and verifies the
+`CON_KLEMA_2 … CON_KLEMA_12` family (11 components) is present. Exit code is `0`
+on success.
+
+Useful flags:
+
+```bash
+python list_components.py --limit 0        # list all 714 components
+python list_components.py --no-list        # verification only
+python list_components.py path/to/lib.SchLib
+```
+
+## Library usage
+
+```python
+from altium_schlib import SchLib
+
+with SchLib("input/01_AD_Schematic_Library_24_09_2021.SchLib") as lib:
+    print(len(lib), "components")            # 714
+    for name in lib.component_names:
+        print(name)
+
+    comp = lib.get_component("CON_KLEMA_2")
+    print(comp.name, comp.pin_count, comp.description)
+
+    # Edit a header field and a parameter, then save a copy.
+    comp.set_header_field("ComponentDescription", "2-way terminal block")
+    comp.set_parameter("Value", "5.08mm")     # returns False if no such param
+    lib.save("output/edited.SchLib")
+```
+
+### API surface
+
+- `SchLib(path)` — open a library.
+  - `.component_names` — authoritative names (from `FileHeader`), in order.
+  - `.components` — list of `Component`, lazily loaded.
+  - `.get_component(name)` / `.has_component(name)` — look up by `LibReference`
+    or storage name.
+  - `.storage_name_for(name)` — resolve a name to its OLE storage.
+  - `.header` — `LibraryHeader` (metadata + component list).
+  - `.save(path)` — write a new `.SchLib`.
+- `Component`
+  - `.name`, `.description`, `.pin_count`, `.part_count`, `.design_item_id`
+  - `.records` — all parsed `Record`s; `.records_of_type(id)`, `.parameters`
+  - `.get_parameter(name)` / `.set_parameter(name, text)`
+  - `.set_header_field(key, value)`
+  - `.to_data_stream()` — serialize records back to bytes
+- `Record` — one record block; `.get/.set/.remove`, `.record_id`, `.is_text`,
+  `.is_binary`, `.dirty`.
+
+## File format notes
+
+A `.SchLib` is an **OLE2 / Compound File Binary Format** container
+(magic `D0 CF 11 E0`). Structure:
+
+```
+/ (root, CLSID = 49A4C073-... Altium schematic library)
+├── FileHeader     library metadata + component list (CompCount, LibRef0..N)
+├── SectionKeys    maps long LibRef names -> storage names (disambiguation)
+├── Storage        embedded binary payload (preserved verbatim)
+├── <Component A>/
+│   ├── Data        the component's records
+│   └── PinTextData
+├── <Component B>/
+│   └── ...
+└── ...
+```
+
+**Record framing** inside a `Data` stream — a flat sequence of blocks, each:
+
+```
+uint32 header (little-endian)
+    length = header & 0x00FF_FFFF     # payload length
+    flag   = header >> 24             # 0 = text record, 1 = binary pin record
+payload[length]
+```
+
+- **Text records** are `|KEY=VALUE|KEY=VALUE|...` ASCII, terminated by one
+  `\x00` (counted in `length`). The first record (`RECORD=1`) is the component
+  header; `RECORD=41` records are parameters; `RECORD=2` pins are stored as
+  binary (`flag = 1`) and preserved opaquely.
+
+**Name resolution.** OLE storage names can't exceed 31 chars or contain
+`/ \ : !`. Altium sanitizes the `LibReference` into a storage name and, when
+that would truncate or collide, records the mapping in `SectionKeys` (which
+takes precedence). This tool reproduces that logic so every declared component
+resolves to exactly one storage.
+
+## Tests
+
+```bash
+pytest -q
+```
+
+The suite covers record-framing unit round-trips, the `CON_KLEMA` acceptance
+check, byte-exact round-trip of all 714 component streams, bijective name
+resolution, lossless save, and isolated-edit save. Sample-dependent tests skip
+if `input/*.SchLib` is absent; save tests skip without `pywin32`.
+
+## Project layout
+
+```
+altium_schlib/          the library package
+    records.py          record framing + text-record parse/serialize
+    schlib.py           SchLib / Component / LibraryHeader
+    writer.py           compound-file writer (native Structured Storage)
+list_components.py      acceptance/test program (lists + verifies CON_KLEMA)
+tests/test_schlib.py    pytest suite
+input/                  source .SchLib libraries
+output/                 written libraries (git-ignored)
+```

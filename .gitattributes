@@ -1,0 +1,5 @@
+# Normalize text files to LF in the repository.
+* text=auto eol=lf
+
+# Altium libraries are binary OLE2 compound files — never touch their bytes.
+*.SchLib binary
