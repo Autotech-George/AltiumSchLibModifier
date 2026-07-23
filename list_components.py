@@ -64,9 +64,13 @@ def print_library_info(lib: SchLib) -> None:
 
 def list_components(lib: SchLib, limit: int | None) -> None:
     names = lib.component_names
-    shown = names if limit is None else names[:limit]
+    # limit is None -> show all; otherwise clamp into [0, len] so a negative or
+    # oversized value can't produce a nonsensical count.
+    capped = None if limit is None else max(0, min(limit, len(names)))
+    shown = names if capped is None else names[:capped]
+    truncated = capped is not None and capped < len(names)
     print(f"Components ({len(names)} total"
-          + (f", showing first {len(shown)}" if limit else "") + "):")
+          + (f", showing first {len(shown)}" if truncated else "") + "):")
     print("-" * 72)
     width = len(str(len(names)))
     for i, name in enumerate(shown, 1):
@@ -79,8 +83,8 @@ def list_components(lib: SchLib, limit: int | None) -> None:
         except Exception as exc:  # pragma: no cover - defensive
             detail = f"<error: {exc}>"
         print(f"  {i:>{width}}. {name:<44} {detail}")
-    if limit and len(names) > limit:
-        print(f"  ... and {len(names) - limit} more (use --limit 0 to show all)")
+    if truncated:
+        print(f"  ... and {len(names) - len(shown)} more (use --limit 0 to show all)")
     print()
 
 
@@ -108,11 +112,13 @@ def verify_klema(lib: SchLib) -> bool:
     print("-" * 72)
     print(f"  Found {found_count} of {len(EXPECTED_KLEMA)} expected components.")
 
-    # Sanity check: CON_KLEMA_20 exists in this library but must be distinct.
+    # Sanity check: CON_KLEMA_20 exists in this library but must stay distinct
+    # from the 2..12 range (guards against a prefix-matching regression).
     if lib.has_component("CON_KLEMA_20"):
-        in_range = "CON_KLEMA_20" in EXPECTED_KLEMA
-        print(f"  Note: CON_KLEMA_20 also exists and is correctly "
-              f"{'INCLUDED' if in_range else 'excluded'} from the range.")
+        distinct = lib.get_component("CON_KLEMA_20").name == "CON_KLEMA_20"
+        print(f"  Note: CON_KLEMA_20 also exists and resolves "
+              f"{'distinctly' if distinct else 'INCORRECTLY'} "
+              "(not counted in the range).")
 
     passed = found_count == len(EXPECTED_KLEMA)
     print()

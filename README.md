@@ -10,10 +10,26 @@ losslessly (only the bytes you actually changed change).
 ## Status
 
 - ✅ Parse the compound-file container and enumerate all components
-- ✅ Byte-exact round-trip of every component's record stream (verified on 714/714)
+- ✅ Byte-exact round-trip of every component's record stream (verified on 714/714,
+  including the 817 records that contain empty `||` fields)
 - ✅ Resolve component names ↔ OLE storage names (handles truncation & sanitization)
 - ✅ Edit component header fields / parameters in memory
-- ✅ Save to a new `.SchLib` preserving structure and Altium's CLSID
+- ✅ **Atomic** save to a new `.SchLib` (temp file + rename) preserving structure
+  and Altium's CLSID; in-place `save(same_path)` supported
+
+### Limitations
+
+- **No add / remove / rename of components yet.** Those require rewriting the
+  library-level `FileHeader` and `SectionKeys` (and the OLE storage name), which
+  this tool copies verbatim. Editing a component's *identity* fields
+  (`LibReference`, `DesignItemId`) is therefore refused with a clear error;
+  editing `ComponentDescription`, parameters, graphics, etc. is fine.
+- **Non-ASCII component names authored in a non-Latin ANSI code page** (e.g. a
+  Greek/Cyrillic Windows) may not resolve by their declared name: the
+  `FileHeader` stores raw ANSI bytes (read as latin-1) while OLE storage names
+  are Unicode, so the two can disagree. Such components are still reachable via
+  their exact storage name (`lib.storage_names`), and saving preserves them
+  untouched. Fully-ASCII libraries (the common case) are unaffected.
 
 ## Requirements
 
@@ -75,9 +91,12 @@ with SchLib("input/01_AD_Schematic_Library_24_09_2021.SchLib") as lib:
     or storage name.
   - `.storage_name_for(name)` — resolve a name to its OLE storage.
   - `.header` — `LibraryHeader` (metadata + component list).
-  - `.save(path)` — write a new `.SchLib`.
+  - `.declared_count` — the raw `CompCount` field (usually `== len(lib)`).
+  - `.save(path)` — write a new `.SchLib` (atomic; in-place allowed).
 - `Component`
-  - `.name`, `.description`, `.pin_count`, `.part_count`, `.design_item_id`
+  - `.name`, `.description`, `.pin_count`, `.design_item_id`
+  - `.part_count` — true number of parts (Altium stores `parts + 1`);
+    `.raw_part_count` for the stored field
   - `.records` — all parsed `Record`s; `.records_of_type(id)`, `.parameters`
   - `.get_parameter(name)` / `.set_parameter(name, text)`
   - `.set_header_field(key, value)`

@@ -70,7 +70,14 @@ class LibraryHeader:
 
     @property
     def component_names(self) -> List[str]:
-        """Declared ``LibRef`` names, in index order (0..CompCount-1)."""
+        """The declared ``LibRef`` names.
+
+        For a well-formed library these are dense (``LibRef0..CompCount-1``) and
+        returned in index order. Should a header be malformed (a gap in the
+        indices, or entries beyond ``CompCount``), present names are still
+        returned -- gaps are skipped and out-of-range entries appended -- so the
+        result may not line up with ``CompCount``.
+        """
         names: List[Optional[str]] = [None] * self.component_count
         extra: List[str] = []
         for key, value in self._fields:
@@ -94,12 +101,14 @@ class Component:
         self,
         storage_name: str,
         data_stream: bytes,
-        pin_text_data: bytes = b"",
+        pin_text_data: Optional[bytes] = None,
         extra_streams: Optional[Dict[str, bytes]] = None,
     ):
         self.storage_name = storage_name
         self.records: List[Record] = parse_records(data_stream)
-        self.pin_text_data = pin_text_data
+        # None means the storage has no PinTextData stream at all; b"" means a
+        # present-but-empty stream. The distinction is preserved on save.
+        self.pin_text_data: Optional[bytes] = pin_text_data
         # Any streams inside the component storage beyond Data/PinTextData,
         # preserved verbatim so save() reproduces them.
         self.extra_streams: Dict[str, bytes] = dict(extra_streams or {})
@@ -133,12 +142,22 @@ class Component:
         return self._header_get("ComponentDescription")
 
     @property
-    def part_count(self) -> int:
+    def raw_part_count(self) -> int:
+        """The ``PartCount`` field exactly as stored (parts + 1, Protel-style)."""
         try:
-            # Altium stores PartCount as (parts + 1) historically; report raw.
             return int(self._header_get("PartCount", "0") or "0")
         except ValueError:
             return 0
+
+    @property
+    def part_count(self) -> int:
+        """Number of parts (gates) in the component.
+
+        Altium/Protel stores ``PartCount`` as *parts + 1* (a single-part symbol
+        stores ``2``), so the true count is ``PartCount - 1``.
+        """
+        raw = self.raw_part_count
+        return raw - 1 if raw >= 1 else raw
 
     @property
     def pin_count(self) -> int:
@@ -171,10 +190,23 @@ class Component:
         return False
 
     # -- editing -------------------------------------------------------------
+    # Fields that also appear in the library-level FileHeader/SectionKeys and in
+    # the OLE storage name. Editing them only in the component's Data stream
+    # would leave the library internally inconsistent (the component would be
+    # unfindable by its new name), so renaming is refused until it is supported
+    # end-to-end (FileHeader + SectionKeys + storage rename).
+    _IDENTITY_FIELDS = ("LibReference", "DesignItemId")
+
     def set_header_field(self, key: str, value: str) -> None:
         h = self.header
         if h is None:
             raise ValueError(f"{self.storage_name}: no header record")
+        if key in self._IDENTITY_FIELDS and value != h.get(key):
+            raise ValueError(
+                f"refusing to change {key!r}: it is mirrored in the library "
+                f"FileHeader/SectionKeys and the OLE storage name. Renaming a "
+                f"component is not yet supported (it would corrupt the library)."
+            )
         h.set(key, value)
 
     @property
@@ -214,13 +246,20 @@ class SchLib:
     def __init__(self, path: str):
         self.path = path
         self._ole = olefile.OleFileIO(path)
-        header_bytes = self._read_root("FileHeader")
-        if header_bytes is None:
-            raise ValueError(f"{path}: no FileHeader stream; not a SchLib?")
-        self.header = LibraryHeader(header_bytes)
-        self._section_keys = self._parse_section_keys()
-        self._storages = self._list_storages()
-        self._components: Dict[str, Component] = {}  # storage_name -> Component
+        # Anything past this point may raise (e.g. not a SchLib); make sure the
+        # OLE file handle is closed rather than leaked if construction fails.
+        try:
+            header_bytes = self._read_root("FileHeader")
+            if header_bytes is None:
+                raise ValueError(f"{path}: no FileHeader stream; not a SchLib?")
+            self.header = LibraryHeader(header_bytes)
+            self._section_keys = self._parse_section_keys()
+            self._storages = self._list_storages()
+            self._components: Dict[str, Component] = {}  # storage_name -> Component
+        except BaseException:
+            self._ole.close()
+            self._ole = None
+            raise
 
     # -- context manager -----------------------------------------------------
     def __enter__(self) -> "SchLib":
@@ -309,6 +348,11 @@ class SchLib:
         return self.header.component_names
 
     @property
+    def declared_count(self) -> int:
+        """The ``CompCount`` field from the FileHeader, exactly as stored."""
+        return self.header.component_count
+
+    @property
     def storage_names(self) -> List[str]:
         return list(self._storages)
 
@@ -316,7 +360,7 @@ class SchLib:
         if storage_name in self._components:
             return self._components[storage_name]
         data = self._read_stream([storage_name, "Data"])
-        pin_text = b""
+        pin_text: Optional[bytes] = None  # None = stream absent (vs. empty)
         if self._ole.exists([storage_name, "PinTextData"]):
             pin_text = self._read_stream([storage_name, "PinTextData"])
         extra: Dict[str, bytes] = {}
@@ -356,7 +400,9 @@ class SchLib:
         return result
 
     def __len__(self) -> int:
-        return self.header.component_count
+        # Number of names actually enumerated, so len(lib) == len(list(names)).
+        # For well-formed libraries this equals declared_count (CompCount).
+        return len(self.component_names)
 
     def __iter__(self):
         return iter(self.components)
@@ -385,7 +431,7 @@ class SchLib:
             storage_tree: "OrderedDict[str, bytes]" = OrderedDict()
             if comp is not None:
                 storage_tree["Data"] = comp.to_data_stream()
-                if comp.pin_text_data:
+                if comp.pin_text_data is not None:  # preserve empty streams too
                     storage_tree["PinTextData"] = comp.pin_text_data
                 for sname, sbytes in comp.extra_streams.items():
                     storage_tree[sname] = sbytes
@@ -399,12 +445,39 @@ class SchLib:
         return tree
 
     def save(self, path: str) -> None:
-        """Write the (possibly edited) library to ``path`` as a new SchLib."""
+        """Write the (possibly edited) library to ``path`` as a new SchLib.
+
+        The write is atomic (temp file + :func:`os.replace`), so an existing
+        file is only replaced once the new one is fully committed. Saving in
+        place (``path == self.path``) is supported: the source handle is
+        released for the swap and reopened on the freshly-written file.
+        """
+        import os
+
         from .writer import write_compound_file
 
+        if self._ole is None:
+            raise ValueError("library is closed")
+
+        # Materialize every stream (reads through the open handle) BEFORE any
+        # handle juggling, so the in-place case has no lingering dependency.
         tree = self._build_stream_tree()
         root_clsid = getattr(self._ole.root, "clsid", None)
-        write_compound_file(path, tree, root_clsid=root_clsid)
+
+        in_place = (
+            os.path.normcase(os.path.abspath(path))
+            == os.path.normcase(os.path.abspath(self.path))
+        )
+        if in_place:
+            self._ole.close()
+            self._ole = None
+        try:
+            write_compound_file(path, tree, root_clsid=root_clsid)
+        finally:
+            if in_place:
+                # Reopen so the object stays usable. On success this points at
+                # the new file; on failure the original is intact (atomic write).
+                self._ole = olefile.OleFileIO(self.path)
 
     def __repr__(self) -> str:
         return (

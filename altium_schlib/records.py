@@ -16,9 +16,14 @@ Two block kinds are observed in SchLib files:
   stored in a packed binary layout). We treat these as opaque blobs and
   preserve them byte-for-byte.
 
-This module never guesses: unmodified records are re-emitted from their
-original bytes, so parsing then serializing an untouched stream is a byte-exact
-round-trip. Only records whose fields were edited are rebuilt.
+Round-trip fidelity is the central guarantee. A text payload is modelled as the
+raw list of ``|``-separated *chunks* (``payload.split(b"|")``), because
+``"|".join(chunks)`` is an exact inverse of the split for *any* input --
+including consecutive pipes (``||``), a trailing ``|``, a lone ``|``, and bare
+tokens that contain no ``=``. Editing a single field rewrites only that chunk;
+every other byte (empty fields, unusual encodings, field order) is preserved.
+Unmodified records are re-emitted from their original bytes, so parsing then
+serializing an untouched stream is byte-identical.
 """
 
 from __future__ import annotations
@@ -80,59 +85,58 @@ def serialize_record_block(flag: int, payload: bytes) -> bytes:
     return struct.pack("<I", header) + payload
 
 
-def parse_text_payload(payload: bytes) -> Tuple[List[Tuple[str, str]], bool]:
-    """Parse a text-record payload into ``([(key, value), ...], had_null)``.
+def parse_text_payload(payload: bytes) -> Tuple[List[str], bool]:
+    """Parse a text-record payload into ``(chunks, had_null)``.
 
-    Field order and duplicate keys are preserved by returning a list of pairs.
-    ``had_null`` records whether the payload ended with the ``\\x00``
-    terminator so serialization can reproduce it exactly.
+    ``chunks`` is ``payload.split("|")`` (minus the trailing null), preserving
+    every field exactly -- including empty ones. ``had_null`` records whether
+    the payload ended with the ``\\x00`` terminator so serialization can
+    reproduce it.
     """
     had_null = payload.endswith(b"\x00")
     body = payload[:-1] if had_null else payload
-    text = body.decode(ENCODING)
-    fields: List[Tuple[str, str]] = []
-    # A leading '|' yields an empty first element; skip empties rather than
-    # emitting phantom ('', '') pairs.
-    for chunk in text.split("|"):
-        if not chunk:
-            continue
-        key, sep, value = chunk.partition("=")
-        fields.append((key, value) if sep else (chunk, ""))
-    return fields, had_null
+    chunks = body.decode(ENCODING).split("|")
+    return chunks, had_null
 
 
-def serialize_text_payload(fields: List[Tuple[str, str]], had_null: bool) -> bytes:
-    """Inverse of :func:`parse_text_payload`.
-
-    Produces ``|k=v|k=v|...`` (leading pipe reproduced) plus the trailing null
-    when ``had_null`` is set.
-    """
-    text = "".join(f"|{key}={value}" for key, value in fields)
-    payload = text.encode(ENCODING)
+def serialize_text_payload(chunks: List[str], had_null: bool) -> bytes:
+    """Inverse of :func:`parse_text_payload`: ``"|".join(chunks)`` (+ null)."""
+    payload = "|".join(chunks).encode(ENCODING)
     if had_null:
         payload += b"\x00"
     return payload
 
 
+def _split_chunk(chunk: str) -> Tuple[str, Optional[str]]:
+    """Split a chunk into ``(key, value)``; ``value`` is ``None`` if no ``=``.
+
+    Distinguishing "no ``=``" (value ``None``) from "empty value" (value ``""``)
+    matters for exact round-tripping: a bare token must not gain a spurious
+    ``=`` when its record is re-serialized.
+    """
+    key, sep, value = chunk.partition("=")
+    return (key, value) if sep else (chunk, None)
+
+
 class Record:
     """A single record block within a Data stream.
 
-    Text records expose their parameters as ordered ``(key, value)`` pairs and
-    can be edited; binary (pin) records are preserved as opaque bytes. A record
-    only rebuilds its bytes when it has actually been modified, so untouched
-    records round-trip exactly.
+    Text records expose their parameters as ``key=value`` fields and can be
+    edited; binary (pin) records are preserved as opaque bytes. A record only
+    rebuilds its bytes when it has actually been modified, so untouched records
+    round-trip exactly.
     """
 
-    __slots__ = ("flag", "_raw", "_fields", "_had_null", "_dirty")
+    __slots__ = ("flag", "_raw", "_chunks", "_had_null", "_dirty")
 
     def __init__(self, flag: int, payload: bytes):
         self.flag = flag
         self._raw = payload
         self._dirty = False
-        self._fields: Optional[List[Tuple[str, str]]] = None
+        self._chunks: Optional[List[str]] = None
         self._had_null = False
         if flag == FLAG_TEXT:
-            self._fields, self._had_null = parse_text_payload(payload)
+            self._chunks, self._had_null = parse_text_payload(payload)
 
     # -- introspection -------------------------------------------------------
     @property
@@ -146,8 +150,6 @@ class Record:
     @property
     def record_id(self) -> Optional[int]:
         """The numeric ``RECORD=`` type of a text record, else ``None``."""
-        if self._fields is None:
-            return None
         raw = self.get("RECORD")
         try:
             return int(raw) if raw is not None else None
@@ -155,50 +157,68 @@ class Record:
             return None
 
     @property
-    def fields(self) -> List[Tuple[str, str]]:
-        """The ordered ``(key, value)`` pairs (text records only)."""
-        if self._fields is None:
+    def fields(self) -> Tuple[Tuple[str, str], ...]:
+        """An immutable snapshot of the ``key=value`` fields (text records).
+
+        Returns a tuple so accidental in-place mutation fails loudly instead of
+        being silently discarded -- edits must go through :meth:`set` /
+        :meth:`remove`. Bare tokens and empty fields are not included here but
+        are still preserved on serialization.
+        """
+        if self._chunks is None:
             raise TypeError("binary record has no text fields")
-        return self._fields
+        out: List[Tuple[str, str]] = []
+        for chunk in self._chunks:
+            key, value = _split_chunk(chunk)
+            if value is not None:
+                out.append((key, value))
+        return tuple(out)
 
     # -- field access --------------------------------------------------------
     def get(self, key: str, default: Optional[str] = None) -> Optional[str]:
-        if self._fields is None:
+        if self._chunks is None:
             return default
-        for k, v in self._fields:
-            if k == key:
+        for chunk in self._chunks:
+            k, v = _split_chunk(chunk)
+            if v is not None and k == key:
                 return v
         return default
 
     def set(self, key: str, value: str) -> None:
         """Set (or append) a field's value, marking the record dirty."""
-        if self._fields is None:
+        if self._chunks is None:
             raise TypeError("cannot set fields on a binary record")
         value = str(value)
-        for i, (k, _) in enumerate(self._fields):
-            if k == key:
-                if self._fields[i][1] != value:
-                    self._fields[i] = (k, value)
+        new_chunk = f"{key}={value}"
+        for i, chunk in enumerate(self._chunks):
+            k, v = _split_chunk(chunk)
+            if v is not None and k == key:
+                if chunk != new_chunk:
+                    self._chunks[i] = new_chunk
                     self._dirty = True
                 return
-        self._fields.append((key, value))
+        self._chunks.append(new_chunk)
         self._dirty = True
 
     def remove(self, key: str) -> bool:
-        if self._fields is None:
+        if self._chunks is None:
             raise TypeError("cannot remove fields on a binary record")
-        before = len(self._fields)
-        self._fields = [(k, v) for k, v in self._fields if k != key]
-        if len(self._fields) != before:
+        kept = []
+        removed = False
+        for chunk in self._chunks:
+            k, v = _split_chunk(chunk)
+            if v is not None and k == key:
+                removed = True
+                continue
+            kept.append(chunk)
+        if removed:
+            self._chunks = kept
             self._dirty = True
-            return True
-        return False
+        return removed
 
     def as_dict(self) -> dict:
         """Fields as a plain dict (last value wins on duplicate keys)."""
-        if self._fields is None:
-            return {}
-        return dict(self._fields)
+        return dict(self.fields)
 
     # -- serialization -------------------------------------------------------
     @property
@@ -207,8 +227,8 @@ class Record:
 
     @property
     def payload(self) -> bytes:
-        if self._dirty and self._fields is not None:
-            return serialize_text_payload(self._fields, self._had_null)
+        if self._dirty and self._chunks is not None:
+            return serialize_text_payload(self._chunks, self._had_null)
         return self._raw
 
     def to_bytes(self) -> bytes:
@@ -216,8 +236,8 @@ class Record:
 
     def __repr__(self) -> str:
         if self.is_text:
-            rid = self.record_id
-            return f"<Record text RECORD={rid} fields={len(self._fields or [])}>"
+            n = len(self._chunks) if self._chunks is not None else 0
+            return f"<Record text RECORD={self.record_id} chunks={n}>"
         return f"<Record binary flag={self.flag} bytes={len(self._raw)}>"
 
 

@@ -12,6 +12,8 @@ nested ``{name: bytes | {name: ...}}`` tree of storages and streams.
 
 from __future__ import annotations
 
+import os
+import tempfile
 from typing import Dict, Optional, Union
 
 import pythoncom
@@ -59,18 +61,7 @@ def _write_tree(storage, tree: StreamTree) -> None:
             )
 
 
-def write_compound_file(
-    path: str,
-    tree: StreamTree,
-    root_clsid: Optional[str] = None,
-) -> None:
-    """Write ``tree`` to ``path`` as a compound file.
-
-    ``tree`` maps entry names to either ``bytes`` (a stream) or a nested dict
-    (a storage). ``root_clsid`` (e.g. Altium's schematic-library CLSID) is
-    stamped on the root storage when provided and non-null, so the target
-    application recognizes the file type.
-    """
+def _write_docfile(path: str, tree: StreamTree, root_clsid: Optional[str]) -> None:
     root = pythoncom.StgCreateDocfile(path, _ROOT_MODE)
     try:
         if root_clsid and root_clsid != _NULL_CLSID:
@@ -80,3 +71,37 @@ def write_compound_file(
         root.Commit(sc.STGC_DEFAULT)
     finally:
         root = None
+
+
+def write_compound_file(
+    path: str,
+    tree: StreamTree,
+    root_clsid: Optional[str] = None,
+) -> None:
+    """Write ``tree`` to ``path`` as a compound file, atomically.
+
+    ``tree`` maps entry names to either ``bytes`` (a stream) or a nested dict
+    (a storage). ``root_clsid`` (e.g. Altium's schematic-library CLSID) is
+    stamped on the root storage when provided and non-null, so the target
+    application recognizes the file type.
+
+    The file is built in a temporary file in the same directory and then moved
+    into place with :func:`os.replace`, so an existing file at ``path`` is only
+    ever replaced by a fully-written, committed docfile. A failure mid-write
+    leaves the original ``path`` untouched. NOTE: writing over a file that is
+    still open elsewhere (e.g. the source library) may fail on Windows -- close
+    such handles first; :meth:`SchLib.save` handles this for in-place saves.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(suffix=".schlib.tmp", dir=directory)
+    os.close(fd)  # StgCreateDocfile reopens/truncates the path itself
+    try:
+        _write_docfile(tmp, tree, root_clsid)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:  # pragma: no cover - best-effort cleanup
+            pass
+        raise

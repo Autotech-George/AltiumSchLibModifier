@@ -22,3 +22,6 @@ env/
 
 # Generated output libraries (keep the folder, ignore produced files)
 /output/*.SchLib
+
+# Claude Code runtime artifacts
+.claude/scheduled_tasks.lock
