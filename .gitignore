@@ -20,7 +20,9 @@ env/
 *.swp
 .DS_Store
 
-# Generated output libraries (keep the folder, ignore produced files)
+# Input/output libraries are kept out of version control (they may be
+# proprietary). Keep the folders, ignore the .SchLib files themselves.
+/input/*.SchLib
 /output/*.SchLib
 
 # Claude Code runtime artifacts
