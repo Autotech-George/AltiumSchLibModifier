@@ -962,6 +962,127 @@ def test_cli_set_refuses_overwriting_input():
         cli.main(["--set", "Mount=X", "--all", "-o", SAMPLE])
 
 
+# -- fonts -------------------------------------------------------------------
+@needs_sample
+def test_fonts_table_and_usage_valid(lib):
+    table = lib.fonts()
+    assert len(table) == int(lib.header.get("FontIdCount"))
+    assert all(e["name"] for e in table.values())
+    usage = lib.font_usage()
+    # every referenced FontID resolves to a table entry
+    assert set(usage) <= set(table)
+    assert all(u["uses"] >= u["components"] >= 1 for u in usage.values())
+
+
+@needs_sample
+def test_rename_fonts_preserves_size_and_styles(tmp_path):
+    with SchLib(SAMPLE) as lib:
+        before = lib.fonts()
+        summary = lib.rename_fonts("ZZTestFace")
+        after = lib.fonts()
+        # every entry not already named ZZTestFace changed; geometry intact
+        assert summary["changed_count"] == sum(
+            1 for e in before.values() if e["name"] != "ZZTestFace")
+        assert set(after) == set(before)
+        for k in before:
+            assert after[k]["name"] == "ZZTestFace"
+            assert after[k]["size"] == before[k]["size"]
+            assert after[k]["styles"] == before[k]["styles"]
+            assert after[k]["rotation"] == before[k]["rotation"]
+        # idempotent: second run changes nothing
+        assert lib.rename_fonts("ZZTestFace")["changed_count"] == 0
+
+
+@needs_sample
+def test_rename_fonts_only_filter(tmp_path):
+    with SchLib(SAMPLE) as lib:
+        before = lib.fonts()
+        target = before[sorted(before)[0]]["name"]  # some real typeface
+        summary = lib.rename_fonts("ZZOnlyFace", only_names=[target.upper()])
+        after = lib.fonts()
+        for k in before:
+            expected = "ZZOnlyFace" if before[k]["name"] == target else before[k]["name"]
+            assert after[k]["name"] == expected
+        assert summary["changed_count"] == sum(
+            1 for e in before.values() if e["name"] == target)
+
+
+@needs_sample
+def test_rename_fonts_rejects_bad_names(lib):
+    with pytest.raises(ValueError):
+        lib.rename_fonts("bad|name")
+    with pytest.raises(ValueError):
+        lib.rename_fonts("café")  # non-ASCII
+
+
+@needs_sample
+@needs_pywin32
+def test_rename_fonts_roundtrip_isolated_to_fileheader(tmp_path):
+    out = str(tmp_path / "fonts.SchLib")
+    with SchLib(SAMPLE) as lib:
+        count_before = lib.header.get("FontIdCount")
+        lib.rename_fonts("ZZTestFace")
+        lib.save(out)
+
+    with SchLib(out) as lib2:
+        assert all(e["name"] == "ZZTestFace" for e in lib2.fonts().values())
+        assert lib2.header.get("FontIdCount") == count_before
+
+    before, cb = _stream_map(SAMPLE)
+    after, ca = _stream_map(out)
+    assert ca == cb
+    changed = [k for k in before if before[k] != after.get(k)]
+    assert changed == [("FileHeader",)], changed  # nothing else touched
+
+
+@needs_sample
+def test_font_tool_cli_stats(capsys):
+    import json
+
+    import font_tool as cli
+
+    assert cli.main(["--json"]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["font_count"] >= 1
+    assert doc["fonts"][0]["name"]
+    assert doc["by_typeface"]
+    # text mode runs too
+    assert cli.main([]) == 0
+    out = capsys.readouterr().out
+    assert "Font table" in out and "Typeface" in out
+
+
+@needs_sample
+def test_font_tool_cli_dry_run_and_guards(tmp_path, capsys):
+    import json
+
+    import font_tool as cli
+
+    out = tmp_path / "nope.SchLib"
+    rc = cli.main(["--rename-to", "ZZFace", "--dry-run", "-o", str(out),
+                   "--json"])
+    assert rc == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["dry_run"] is True and doc["output"] is None
+    assert doc["changed_count"] >= 1
+    assert not out.exists()
+    with pytest.raises(SystemExit):
+        cli.main(["--only", "X"])  # filters require --rename-to
+    with pytest.raises(SystemExit):
+        cli.main(["--rename-to", "ZZFace", "--ids", "1,x"])
+
+
+@needs_sample
+@needs_pywin32
+def test_font_tool_cli_rename_writes(tmp_path):
+    import font_tool as cli
+
+    out = tmp_path / "renamed.SchLib"
+    assert cli.main(["--rename-to", "ZZFace", "-o", str(out)]) == 0
+    with SchLib(str(out)) as lib:
+        assert all(e["name"] == "ZZFace" for e in lib.fonts().values())
+
+
 # -- shared CLI selector plumbing (cli_common) ------------------------------
 def test_split_pair_negation():
     from cli_common import split_pair

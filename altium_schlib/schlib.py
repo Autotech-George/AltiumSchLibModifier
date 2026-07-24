@@ -405,6 +405,16 @@ class SchLib:
             if header_bytes is None:
                 raise ValueError(f"{path}: no FileHeader stream; not a SchLib?")
             self.header = LibraryHeader(header_bytes)
+            # The FileHeader is itself record-framed (normally a single text
+            # record). Keep it parsed as Records so library-level fields (e.g.
+            # the font table) can be edited; untouched records re-serialize
+            # byte-exactly, so this does not perturb lossless saves. If parsing
+            # ever fails, fall back to verbatim copies (editing disabled).
+            try:
+                self._header_records: Optional[List[Record]] = parse_records(
+                    header_bytes)
+            except ValueError:  # pragma: no cover - malformed header
+                self._header_records = None
             self._section_keys = self._parse_section_keys()
             self._storages = self._list_storages()
             self._components: Dict[str, Component] = {}  # storage_name -> Component
@@ -632,6 +642,104 @@ class SchLib:
             "total": len(self.component_names),
         }
 
+    # -- fonts ----------------------------------------------------------------
+    # The font table lives in the FileHeader stream: FontIdCount=N plus
+    # Size<k>/FontName<k> and optional style flags (Bold/Italic/Underline/
+    # Strikeout=T, Rotation=90/270) for k = 1..N. Records reference entries by
+    # index via FontID=<k>, so renaming a typeface in the table restyles every
+    # reference -- including any hidden inside opaque binary records -- without
+    # touching a single component stream.
+    _FONT_STYLE_KEYS = ("Bold", "Italic", "Underline", "Strikeout")
+
+    @property
+    def _header_record(self) -> Record:
+        """The FileHeader's (first) text record, required for editing."""
+        if not self._header_records:
+            raise ValueError("FileHeader could not be parsed; editing disabled")
+        return self._header_records[0]
+
+    def fonts(self) -> Dict[int, dict]:
+        """The font table: ``{id: {name, size, styles, rotation}}``."""
+        try:
+            count = int(self.header.get("FontIdCount", "0") or 0)
+        except ValueError:
+            count = 0
+        table: Dict[int, dict] = {}
+        for k in range(1, count + 1):
+            name = self.header.get(f"FontName{k}")
+            if name is None:
+                continue
+            table[k] = {
+                "name": name,
+                "size": self.header.get(f"Size{k}"),
+                "styles": [s for s in self._FONT_STYLE_KEYS
+                           if self.header.get(f"{s}{k}") == "T"],
+                "rotation": self.header.get(f"Rotation{k}"),
+            }
+        return table
+
+    def font_usage(self) -> Dict[int, dict]:
+        """Aggregate ``FontID`` reference statistics across all components.
+
+        Returns ``{font_id: {"uses": n, "components": n, "by_record": {rid: n}}}``.
+        Counted from text records only -- binary pin records are opaque and not
+        scanned (renaming via the table covers them regardless).
+        """
+        usage: Dict[int, dict] = {}
+        for comp in self.components:
+            seen = set()
+            for r in comp.records:
+                if not r.is_text:
+                    continue
+                raw = r.get("FontID")
+                if raw is None:
+                    continue
+                try:
+                    fid = int(raw)
+                except ValueError:
+                    continue
+                u = usage.setdefault(fid, {"uses": 0, "components": 0,
+                                           "by_record": {}})
+                u["uses"] += 1
+                rid = r.record_id
+                u["by_record"][rid] = u["by_record"].get(rid, 0) + 1
+                if fid not in seen:
+                    u["components"] += 1
+                    seen.add(fid)
+        return usage
+
+    def rename_fonts(self, new_name: str, *, only_names=None,
+                     only_ids=None) -> dict:
+        """Set the typeface of font-table entries to ``new_name``.
+
+        Sizes, styles, and rotations are preserved -- only ``FontName<k>``
+        changes, so every ``FontID`` reference stays valid. ``only_names``
+        restricts the change to entries currently using one of those typefaces
+        (case-insensitive); ``only_ids`` to specific entry ids. With neither,
+        every entry is renamed. Does not save.
+        """
+        new_name = str(new_name)
+        Component._validate_param_field("font name", new_name, allow_equals=True)
+        rec = self._header_record
+        name_filter = ({n.casefold() for n in only_names}
+                       if only_names else None)
+        id_filter = set(only_ids) if only_ids else None
+        changed, skipped = [], []
+        for k, entry in self.fonts().items():
+            selected = ((name_filter is None or
+                         entry["name"].casefold() in name_filter)
+                        and (id_filter is None or k in id_filter))
+            if not selected or entry["name"] == new_name:
+                skipped.append(k)
+                continue
+            rec.set(f"FontName{k}", new_name)
+            changed.append(k)
+        if changed:
+            # Refresh the read-side view so header.get() reflects the edit.
+            self.header = LibraryHeader(serialize_records(self._header_records))
+        return {"new_name": new_name, "changed": changed, "skipped": skipped,
+                "changed_count": len(changed), "table_size": len(self.fonts())}
+
     # -- saving --------------------------------------------------------------
     def _build_stream_tree(self) -> dict:
         """Capture every stream from the source, substituting edited ones."""
@@ -639,8 +747,13 @@ class SchLib:
 
         tree: "OrderedDict[str, object]" = OrderedDict()
 
-        # Root streams first, in canonical order.
+        # Root streams first, in canonical order. FileHeader is emitted from
+        # its parsed records (byte-exact when untouched) so library-level edits
+        # such as font renames are written out.
         for name in self.ROOT_STREAMS:
+            if name == "FileHeader" and self._header_records is not None:
+                tree[name] = serialize_records(self._header_records)
+                continue
             raw = self._read_root(name)
             if raw is not None:
                 tree[name] = raw

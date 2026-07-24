@@ -19,6 +19,7 @@ losslessly (only the bytes you actually changed change).
 - ✅ **Batch-set a parameter by query** — set a parameter's value on components
   matching a composable query (name / parameter / designator / pins) — see
   `batch_set_parameter.py`
+- ✅ **Font statistics & batch typeface change** — see `font_tool.py`
 - ✅ **Atomic** save to a new `.SchLib` (temp file + rename) preserving structure
   and Altium's CLSID; in-place `save(same_path)` supported
 
@@ -253,6 +254,45 @@ To match a value that literally starts with `!`, escape it as `\!`. (In bash,
 single-quote arguments containing `!` to dodge history expansion; PowerShell
 and cmd need no special quoting.)
 
+## Fonts (`font_tool.py`)
+
+A `.SchLib` has one **global font table** in its `FileHeader`: each entry is a
+typeface + size + style/rotation (`FontIdCount=N`, `FontName<k>`, `Size<k>`,
+optional `Bold/Italic/Underline/Strikeout<k>=T`, `Rotation<k>`), and every text
+object references an entry by `FontID`. Typeface variance creeps in with the
+component source (self-made vs. distributor downloads); this tool shows it and
+consolidates it.
+
+```bash
+python font_tool.py            # statistics: table, per-entry usage, typeface rollup
+python font_tool.py --json
+```
+
+Statistics are aggregate only (no component names): per entry the typeface,
+size, style, how many text records reference it and of which types, plus a
+per-typeface rollup — so you can see at a glance which fonts dominate and pick
+the consolidation target.
+
+```bash
+python font_tool.py --rename-to Tahoma --dry-run   # preview
+python font_tool.py --rename-to Tahoma             # writes output/<input-name>
+python font_tool.py --rename-to Tahoma --only "Courier New"   # one typeface only
+python font_tool.py --rename-to Tahoma --ids 1,3,20           # specific entries
+```
+
+`--rename-to` changes only the **typeface name** of the selected table entries —
+sizes, styles, and rotations are preserved, entries already using the target
+name are skipped, and **no component stream is touched** (only the `FileHeader`
+changes). Because references go through the table, this restyles every text
+object — including any referenced from binary records the parser treats as
+opaque. The name is written as given, so pick one that is actually installed
+(check the statistics first) or Altium will substitute at render time. Usual
+safety: writes to `output/` by default, `--in-place` to overwrite, `--json` for
+scripting.
+
+Programmatically: `lib.fonts()`, `lib.font_usage()`,
+`lib.rename_fonts(name, only_names=..., only_ids=...)`.
+
 ## Output determinism
 
 Running the same command on the same input **twice produces two files that are
@@ -380,6 +420,7 @@ cli_common.py           shared CLI plumbing (query selectors, output safety)
 list_components.py      acceptance program (list / search / show / self-check)
 batch_add_parameter.py  batch add a parameter to all components missing it
 batch_set_parameter.py  batch set a parameter's value on components by query
+font_tool.py            font statistics + batch typeface change
 tests/test_schlib.py    pytest suite
 input/                  source .SchLib libraries
 output/                 written libraries (git-ignored)
