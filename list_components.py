@@ -129,11 +129,47 @@ def verify_klema(lib: SchLib) -> bool:
     return passed
 
 
-def _suggest(lib: SchLib, query: str, limit: int = 8) -> list[str]:
-    """Case-insensitive substring matches over declared + storage names."""
-    q = query.lower()
+def match_components(lib: SchLib, pattern: str) -> list[str]:
+    """Component names containing ``pattern`` (case-insensitive substring).
+
+    Matches over declared LibReference names and, for anything not already
+    covered, the raw OLE storage names -- so a query still finds a component
+    whose storage name was truncated/sanitized. Order follows the FileHeader.
+    """
+    p = pattern.lower()
     pool = list(dict.fromkeys(lib.component_names + lib.storage_names))
-    return [n for n in pool if q in n.lower()][:limit]
+    return [n for n in pool if p in n.lower()]
+
+
+def _suggest(lib: SchLib, query: str, limit: int = 8) -> list[str]:
+    """Case-insensitive substring matches (capped), for 'did you mean' hints."""
+    return match_components(lib, query)[:limit]
+
+
+def list_matches(lib: SchLib, pattern: str) -> bool:
+    """List components whose name matches ``pattern``. Returns True if any."""
+    matches = match_components(lib, pattern)
+    print("=" * 72)
+    print(f"Components matching {pattern!r}  ({len(matches)} found)")
+    print("=" * 72)
+    if not matches:
+        print("  (no matches — try a shorter or different substring)")
+        print()
+        return False
+    width = len(str(len(matches)))
+    for i, name in enumerate(matches, 1):
+        try:
+            comp = lib.get_component(name)
+            detail = f"{comp.pin_count} pins"
+            if comp.description:
+                detail += f"  |  {comp.description[:40]}"
+        except Exception as exc:  # pragma: no cover - defensive
+            detail = f"<error: {exc}>"
+        print(f"  {i:>{width}}. {name:<44} {detail}")
+    print()
+    print(f"  Use --show NAME for full details, e.g.  --show {matches[0]}")
+    print()
+    return True
 
 
 def show_component(lib: SchLib, name: str) -> bool:
@@ -242,6 +278,24 @@ def library_to_dict(lib: SchLib) -> dict:
     }
 
 
+def matches_to_dict(lib: SchLib, pattern: str) -> dict:
+    """JSON-serializable summaries of components matching ``pattern``."""
+    matches = []
+    for name in match_components(lib, pattern):
+        try:
+            comp = lib.get_component(name)
+            matches.append({
+                "name": comp.name,
+                "storage_name": comp.storage_name,
+                "description": comp.description,
+                "part_count": comp.part_count,
+                "pin_count": comp.pin_count,
+            })
+        except Exception:  # pragma: no cover - defensive
+            matches.append({"name": name, "resolved": False})
+    return {"pattern": pattern, "count": len(matches), "matches": matches}
+
+
 def _emit_json(obj) -> None:
     print(json.dumps(obj, indent=2))
 
@@ -255,6 +309,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="Max components to list (0 = all). Default 25.")
     parser.add_argument("--no-list", action="store_true",
                         help="Skip the component listing, only run verification.")
+    parser.add_argument("-m", "--match", metavar="PATTERN",
+                        help="List component names containing PATTERN "
+                             "(case-insensitive) and exit, so you can pick one "
+                             "to pass to --show.")
     parser.add_argument("-s", "--show", metavar="NAME",
                         help="Show one component's fields/parameters by name "
                              "(LibReference or storage name) and exit.")
@@ -270,6 +328,7 @@ def main(argv: list[str] | None = None) -> int:
 
     with SchLib(path) as lib:
         # JSON mode: clean machine-readable output, no banner/verification.
+        # --show (one component) takes precedence over --match (a filtered list).
         if args.json:
             if args.show is not None:
                 if not lib.has_component(args.show):
@@ -277,8 +336,12 @@ def main(argv: list[str] | None = None) -> int:
                                 "suggestions": _suggest(lib, args.show)})
                     return 1
                 _emit_json(component_to_dict(lib.get_component(args.show)))
-            else:
-                _emit_json(library_to_dict(lib))
+                return 0
+            if args.match is not None:
+                result = matches_to_dict(lib, args.match)
+                _emit_json(result)
+                return 0 if result["count"] else 1
+            _emit_json(library_to_dict(lib))
             return 0
 
         # Query mode: show a single component and skip listing/verification.
@@ -286,6 +349,11 @@ def main(argv: list[str] | None = None) -> int:
             print_library_info(lib)
             found = show_component(lib, args.show)
             return 0 if found else 1
+
+        # Search mode: list matching names so the user can then --show one.
+        if args.match is not None:
+            print_library_info(lib)
+            return 0 if list_matches(lib, args.match) else 1
 
         print_library_info(lib)
         if not args.no_list:

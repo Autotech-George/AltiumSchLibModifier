@@ -344,6 +344,48 @@ def test_cli_show_missing_component_suggests(capsys):
 
 
 @needs_sample
+def test_cli_match_lists_family(capsys):
+    import list_components as cli
+
+    assert cli.main(["--match", "klema"]) == 0  # case-insensitive
+    out = capsys.readouterr().out
+    for n in range(2, 13):
+        assert f"CON_KLEMA_{n}" in out
+    assert "CON_KLEMA_20" in out
+    assert "--show" in out  # points the user to the next step
+
+
+@needs_sample
+def test_cli_match_no_results_exits_nonzero(capsys):
+    import list_components as cli
+
+    assert cli.main(["--match", "definitely-not-a-component"]) == 1
+    assert "no matches" in capsys.readouterr().out
+
+
+@needs_sample
+def test_cli_match_json(capsys):
+    import json
+
+    import list_components as cli
+
+    assert cli.main(["--match", "KLEMA", "--json"]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["pattern"] == "KLEMA"
+    assert doc["count"] == 12  # CON_KLEMA_2..12 plus CON_KLEMA_20
+    names = {m["name"] for m in doc["matches"]}
+    assert "CON_KLEMA_20" in names
+
+
+@needs_sample
+def test_match_components_helper(lib):
+    import list_components as cli
+
+    m = cli.match_components(lib, "CON_KLEMA_1")  # 1,10,11,12
+    assert set(m) == {"CON_KLEMA_10", "CON_KLEMA_11", "CON_KLEMA_12"}
+
+
+@needs_sample
 def test_cli_json_single_component(capsys):
     import json
 

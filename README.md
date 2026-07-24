@@ -63,6 +63,19 @@ python list_components.py --no-list        # verification only
 python list_components.py path/to/lib.SchLib
 ```
 
+### Search for components
+
+Not sure of the exact name? `--match` lists every component whose name contains
+a substring (case-insensitive), then pick one to inspect with `--show`:
+
+```bash
+python list_components.py --match KLEMA        # lists CON_KLEMA_2 .. _12, _20
+python list_components.py --show CON_KLEMA_5    # then inspect the one you want
+```
+
+`--match` exits non-zero if nothing matches, and honours `--json` (emitting
+`{"pattern", "count", "matches": [...]}`).
+
 ### Inspect one component
 
 Query a single component by name (its `LibReference` or raw storage name) to see
