@@ -35,30 +35,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from altium_schlib import SchLib  # noqa: E402
-from list_components import find_default_schlib  # noqa: E402
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-def _same_path(a: str, b: str) -> bool:
-    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
-
-
-def _resolve_output(input_path: str, args) -> str:
-    """Decide where to write, never clobbering the input unless --in-place."""
-    if args.in_place:
-        return input_path
-    if args.output:
-        out = args.output
-        if _same_path(out, input_path):
-            raise SystemExit(
-                "Refusing to overwrite the input file; use --in-place to do that."
-            )
-        return out
-    # Default: ./output/<input basename>
-    out_dir = os.path.join(HERE, "output")
-    os.makedirs(out_dir, exist_ok=True)
-    return os.path.join(out_dir, os.path.basename(input_path))
+from cli_common import find_default_schlib, resolve_output  # noqa: E402
 
 
 def main(argv=None) -> int:
@@ -99,7 +76,7 @@ def main(argv=None) -> int:
 
         out_path = None
         if not args.dry_run:
-            out_path = _resolve_output(path, args)
+            out_path = resolve_output(path, args.output, args.in_place)
             try:
                 lib.save(out_path)
             except ImportError as exc:  # pragma: no cover - platform dependent

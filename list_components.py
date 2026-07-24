@@ -24,7 +24,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
 import sys
@@ -33,23 +32,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from altium_schlib import SchLib, parse_records, serialize_records  # noqa: E402
-
-
-def find_default_schlib() -> str:
-    """Locate a single .SchLib under ./input, or raise a helpful error."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    matches = sorted(glob.glob(os.path.join(here, "input", "*.SchLib")))
-    if not matches:
-        raise SystemExit(
-            "No .SchLib found in ./input. Pass the file path explicitly:\n"
-            "    python list_components.py path/to/library.SchLib"
-        )
-    if len(matches) > 1:
-        names = "\n  ".join(os.path.basename(m) for m in matches)
-        raise SystemExit(
-            f"Multiple .SchLib files in ./input; specify one:\n  {names}"
-        )
-    return matches[0]
+from cli_common import (  # noqa: E402  (find_default_schlib re-exported)
+    add_selector_arguments,
+    build_predicate,
+    find_default_schlib,
+    select_components,
+)
 
 
 def print_library_info(lib: SchLib) -> None:
@@ -151,18 +139,17 @@ def _suggest(lib: SchLib, query: str, limit: int = 8) -> list[str]:
     return match_components(lib, query)[:limit]
 
 
-def list_matches(lib: SchLib, pattern: str) -> bool:
-    """List components whose name matches ``pattern``. Returns True if any."""
-    matches = match_components(lib, pattern)
+def print_matches(lib: SchLib, names: list[str], label: str) -> bool:
+    """List the given components under a heading. Returns True if any."""
     print("=" * 72)
-    print(f"Components matching {pattern!r}  ({len(matches)} found)")
+    print(f"Components matching {label}  ({len(names)} found)")
     print("=" * 72)
-    if not matches:
-        print("  (no matches — try a shorter or different substring)")
+    if not names:
+        print("  (no matches — try a different query)")
         print()
         return False
-    width = len(str(len(matches)))
-    for i, name in enumerate(matches, 1):
+    width = len(str(len(names)))
+    for i, name in enumerate(names, 1):
         try:
             comp = lib.get_component(name)
             detail = f"{comp.pin_count} pins"
@@ -172,9 +159,14 @@ def list_matches(lib: SchLib, pattern: str) -> bool:
             detail = f"<error: {exc}>"
         print(f"  {i:>{width}}. {name:<44} {detail}")
     print()
-    print(f"  Use --show NAME for full details, e.g.  --show {matches[0]}")
+    print(f"  Use --show NAME for full details, e.g.  --show {names[0]}")
     print()
     return True
+
+
+def list_matches(lib: SchLib, pattern: str) -> bool:
+    """List components whose name matches ``pattern``. Returns True if any."""
+    return print_matches(lib, match_components(lib, pattern), repr(pattern))
 
 
 def show_component(lib: SchLib, name: str) -> bool:
@@ -283,10 +275,10 @@ def library_to_dict(lib: SchLib) -> dict:
     }
 
 
-def matches_to_dict(lib: SchLib, pattern: str) -> dict:
-    """JSON-serializable summaries of components matching ``pattern``."""
+def component_summaries(lib: SchLib, names: list[str]) -> list[dict]:
+    """One-line JSON-serializable summaries for the given components."""
     matches = []
-    for name in match_components(lib, pattern):
+    for name in names:
         try:
             comp = lib.get_component(name)
             matches.append({
@@ -298,6 +290,12 @@ def matches_to_dict(lib: SchLib, pattern: str) -> dict:
             })
         except Exception:  # pragma: no cover - defensive
             matches.append({"name": name, "resolved": False})
+    return matches
+
+
+def matches_to_dict(lib: SchLib, pattern: str) -> dict:
+    """JSON-serializable summaries of components matching ``pattern``."""
+    matches = component_summaries(lib, match_components(lib, pattern))
     return {"pattern": pattern, "count": len(matches), "matches": matches}
 
 
@@ -325,7 +323,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="Emit machine-readable JSON on stdout (a single "
                              "component with --show, else the whole library) "
                              "and skip the human-readable banner/verification.")
+    add_selector_arguments(parser)
     args = parser.parse_args(argv)
+
+    # The full query-selector set (same flags as batch_set_parameter.py) acts
+    # as a search: list only the components the query matches.
+    selector_pred = build_predicate(args)
+    if selector_pred is not None and args.match is not None:
+        raise SystemExit("Use either --match or the selector flags, not both.")
 
     path = args.path or find_default_schlib()
     if not os.path.isfile(path):
@@ -342,6 +347,11 @@ def main(argv: list[str] | None = None) -> int:
                     return 1
                 _emit_json(component_to_dict(lib.get_component(args.show)))
                 return 0
+            if selector_pred is not None:
+                names = select_components(lib, selector_pred)
+                _emit_json({"query": "selectors", "count": len(names),
+                            "matches": component_summaries(lib, names)})
+                return 0 if names else 1
             if args.match is not None:
                 result = matches_to_dict(lib, args.match)
                 _emit_json(result)
@@ -355,7 +365,12 @@ def main(argv: list[str] | None = None) -> int:
             found = show_component(lib, args.show)
             return 0 if found else 1
 
-        # Search mode: list matching names so the user can then --show one.
+        # Search modes: list matching names so the user can then --show one.
+        if selector_pred is not None:
+            print_library_info(lib)
+            names = select_components(lib, selector_pred)
+            return 0 if print_matches(lib, names, "the query selectors") else 1
+
         if args.match is not None:
             print_library_info(lib)
             return 0 if list_matches(lib, args.match) else 1

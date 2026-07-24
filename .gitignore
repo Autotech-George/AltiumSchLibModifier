@@ -21,9 +21,10 @@ env/
 .DS_Store
 
 # Input/output libraries are kept out of version control (they may be
-# proprietary). Keep the folders, ignore the .SchLib files themselves.
-/input/*.SchLib
-/output/*.SchLib
+# proprietary). Keep the folders, ignore the .SchLib files themselves —
+# at any depth, so backup subfolders are covered too.
+/input/**/*.SchLib
+/output/**/*.SchLib
 
 # Claude Code runtime artifacts
 .claude/scheduled_tasks.lock

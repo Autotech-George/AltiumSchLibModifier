@@ -82,6 +82,19 @@ python list_components.py --show <PART_NAME>   # then inspect the one you want
 `--match` exits non-zero if nothing matches, and honours `--json` (emitting
 `{"pattern", "count", "matches": [...]}`).
 
+For anything beyond a name substring, the full **[query selectors](#query-selectors)**
+(the same ones `batch_set_parameter.py` uses) work here too — the listing shows
+only the components the query matches:
+
+```bash
+# Components that HAVE a Mount parameter but with a non-standard value:
+python list_components.py --param-exists Mount \
+    --param "Mount!=Surface Mount" --param "Mount!=Through Hole"
+
+# Through-hole family without the Ethernet parts:
+python list_components.py --name-contains TH_ --name-contains '!ETH_'
+```
+
 ### Inspect one component
 
 Query a single component by name (its `LibReference` or raw storage name) to see
@@ -170,21 +183,7 @@ python batch_set_parameter.py --set Mount="Through Hole" \
 python batch_set_parameter.py --set Mount="Surface Mount" --param "Case/Package=SOIC"
 ```
 
-**Selectors** (combined with AND by default; `--match-any` switches to OR;
-`--ignore-case` for text matches):
-
-| Flag | Selects components where… |
-|---|---|
-| `--name-contains SUB` | name contains SUB (repeatable → any-of) |
-| `--name-excludes SUB` | name contains none of these |
-| `--name-regex RE` | name matches regex RE |
-| `--param NAME=VALUE` | parameter NAME text equals VALUE |
-| `--param-contains NAME=SUB` | parameter NAME text contains SUB |
-| `--param-regex NAME=RE` | parameter NAME text matches RE |
-| `--param-exists NAME` / `--param-missing NAME` | has / lacks parameter NAME |
-| `--designator-prefix P` | designator starts with P (e.g. `R`, `U`) |
-| `--pins-min N` / `--pins-max N` | pin count in range |
-| `--all` | every component (required to match all) |
+It accepts the shared **[query selectors](#query-selectors)** below.
 
 Behaviour:
 
@@ -217,6 +216,42 @@ with SchLib("input/library.SchLib") as lib:
 `query` provides `name_contains/name_excludes/name_regex`,
 `param_equals/param_contains/param_regex/param_exists/param_missing`,
 `designator_prefix`, `pins`, and the combinators `all_of/any_of/negate`.
+
+## Query selectors
+
+Shared by `list_components.py` (search/list the matches) and
+`batch_set_parameter.py` (change the matches). Selectors are **ANDed** by
+default; `--match-any` ORs them; `--ignore-case` makes text matches
+case-insensitive.
+
+| Flag | Selects components where… |
+|---|---|
+| `--name-contains [!]SUB` | name contains SUB (repeatable → any-of) |
+| `--name-excludes SUB` | name contains none of these (≡ `--name-contains '!SUB'`) |
+| `--name-regex [!]RE` | name matches regex RE |
+| `--param NAME[!]=VALUE` | parameter NAME text equals (or `!=` differs from) VALUE |
+| `--param-contains NAME[!]=SUB` | parameter NAME text contains SUB |
+| `--param-regex NAME[!]=RE` | parameter NAME text matches RE |
+| `--param-exists [!]NAME` / `--param-missing [!]NAME` | has / lacks parameter NAME |
+| `--designator-prefix [!]P` | designator starts with P (e.g. `R`, `U`) |
+| `--pins-min N` / `--pins-max N` | pin count in range |
+| `--all` | every component (batch-set requires this to match all) |
+
+**Negation.** Every text selector can be inverted: parameter selectors take the
+`NAME!=VALUE` operator; the others take a leading `!` on the value. A negated
+selector is the pure logical NOT of its positive form — in particular
+`Mount!=X` also matches components with **no** `Mount` parameter at all, so
+combine it with `--param-exists Mount` when you mean "has Mount, but not X":
+
+```bash
+# Has a Mount parameter, but it's neither of the standard values:
+python list_components.py --param-exists Mount \
+    --param "Mount!=Surface Mount" --param "Mount!=Through Hole"
+```
+
+To match a value that literally starts with `!`, escape it as `\!`. (In bash,
+single-quote arguments containing `!` to dodge history expansion; PowerShell
+and cmd need no special quoting.)
 
 ## Output determinism
 
@@ -341,6 +376,7 @@ altium_schlib/          the library package
     schlib.py           SchLib / Component / LibraryHeader
     writer.py           compound-file writer (native Structured Storage)
     query.py            composable component predicates for queries
+cli_common.py           shared CLI plumbing (query selectors, output safety)
 list_components.py      acceptance program (list / search / show / self-check)
 batch_add_parameter.py  batch add a parameter to all components missing it
 batch_set_parameter.py  batch set a parameter's value on components by query

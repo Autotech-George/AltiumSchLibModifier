@@ -962,6 +962,117 @@ def test_cli_set_refuses_overwriting_input():
         cli.main(["--set", "Mount=X", "--all", "-o", SAMPLE])
 
 
+# -- shared CLI selector plumbing (cli_common) ------------------------------
+def test_split_pair_negation():
+    from cli_common import split_pair
+
+    assert split_pair("A=B", "--x") == ("A", "B", False)
+    assert split_pair("A!=B", "--x") == ("A", "B", True)
+    assert split_pair("A=B!=C", "--x") == ("A", "B!=C", False)  # '=' wins first
+    assert split_pair("A!=B=C", "--x") == ("A", "B=C", True)
+    assert split_pair("Mount!=Surface Mount", "--x") == ("Mount", "Surface Mount", True)
+    for bad in ["noequals", "=v", "!=v"]:
+        with pytest.raises(SystemExit):
+            split_pair(bad, "--x")
+
+
+def test_split_negation_and_escape():
+    from cli_common import split_negation
+
+    assert split_negation("ETH_") == ("ETH_", False)
+    assert split_negation("!ETH_") == ("ETH_", True)
+    assert split_negation("\\!literal") == ("!literal", False)  # escaped '!'
+
+
+@needs_sample
+def test_cli_list_selectors_negated_query(capsys):
+    """The flagship negative query: has Mount, but neither standard value."""
+    import json
+
+    import list_components as cli
+
+    with SchLib(SAMPLE) as fresh:
+        expected = []
+        for n in fresh.component_names:
+            c = fresh.get_component(n)
+            if (c.has_parameter("Mount")
+                    and c.get_parameter("Mount") not in ("Surface Mount",
+                                                         "Through Hole")):
+                expected.append(n)
+
+    rc = cli.main(["--param-exists", "Mount",
+                   "--param", "Mount!=Surface Mount",
+                   "--param", "Mount!=Through Hole", "--json"])
+    doc = json.loads(capsys.readouterr().out)
+    assert rc == (0 if expected else 1)
+    assert doc["count"] == len(expected)
+    assert [m["name"] for m in doc["matches"]] == expected
+
+
+@needs_sample
+def test_cli_negated_name_contains_equals_excludes(capsys):
+    import json
+
+    import list_components as cli
+
+    cli.main(["--name-contains", "TH_", "--name-contains", "!ETH_", "--json"])
+    a = json.loads(capsys.readouterr().out)
+    cli.main(["--name-contains", "TH_", "--name-excludes", "ETH_", "--json"])
+    b = json.loads(capsys.readouterr().out)
+    assert a["count"] == b["count"]
+    assert a["matches"] == b["matches"]
+
+
+@needs_sample
+def test_cli_list_selector_text_mode(capsys):
+    import list_components as cli
+
+    rc = cli.main(["--pins-min", "99999"])  # matches nothing
+    out = capsys.readouterr().out
+    assert rc == 1 and "no matches" in out
+    rc = cli.main(["--all"])                # search-mode listing of everything
+    out = capsys.readouterr().out
+    assert rc == 0 and "--show" in out
+
+
+@needs_sample
+def test_cli_list_match_conflicts_with_selectors():
+    import list_components as cli
+
+    with pytest.raises(SystemExit):
+        cli.main(["--match", "X", "--name-contains", "Y"])
+
+
+@needs_sample
+def test_cli_set_rejects_negated_set_spec():
+    import batch_set_parameter as cli
+
+    with pytest.raises(SystemExit):
+        cli.main(["--set", "Mount!=X", "--all", "--dry-run"])
+
+
+@needs_sample
+def test_cli_set_with_negated_selector(capsys):
+    """batch_set accepts the same negated selectors as list_components."""
+    import json
+
+    import batch_set_parameter as cli
+
+    with SchLib(SAMPLE) as fresh:
+        expected = 0
+        for n in fresh.component_names:
+            c = fresh.get_component(n)
+            if (c.has_parameter("Mount")
+                    and c.get_parameter("Mount") != "Surface Mount"):
+                expected += 1
+
+    rc = cli.main(["--set", "ZZ_QSET=V", "--param-exists", "Mount",
+                   "--param", "Mount!=Surface Mount", "--dry-run", "--json"])
+    doc = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert doc["matched_count"] == expected
+
+
 @needs_sample
 @needs_pywin32
 def test_cli_set_writes_and_updates(tmp_path):
