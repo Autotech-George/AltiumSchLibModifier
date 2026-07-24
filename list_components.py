@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import sys
 
@@ -193,6 +194,58 @@ def show_component(lib: SchLib, name: str) -> bool:
     return True
 
 
+def component_to_dict(comp) -> dict:
+    """A JSON-serializable view of a component: identity, header, parameters."""
+    counts: dict = {}
+    for r in comp.records:
+        key = f"RECORD={r.record_id}" if r.is_text else "pin"
+        counts[key] = counts.get(key, 0) + 1
+    header = comp.header
+    return {
+        "name": comp.name,
+        "storage_name": comp.storage_name,
+        "design_item_id": comp.design_item_id,
+        "description": comp.description,
+        "part_count": comp.part_count,
+        "pin_count": comp.pin_count,
+        "header": dict(header.fields) if header is not None else {},
+        "parameters": [
+            {"name": p.get("Name", ""), "text": p.get("Text", "")}
+            for p in comp.parameters
+        ],
+        "record_breakdown": counts,
+    }
+
+
+def library_to_dict(lib: SchLib) -> dict:
+    """A JSON-serializable summary of the whole library and its components."""
+    components = []
+    for name in lib.component_names:
+        try:
+            comp = lib.get_component(name)
+        except Exception:  # pragma: no cover - defensive
+            components.append({"name": name, "resolved": False})
+            continue
+        components.append({
+            "name": comp.name,
+            "storage_name": comp.storage_name,
+            "description": comp.description,
+            "part_count": comp.part_count,
+            "pin_count": comp.pin_count,
+        })
+    return {
+        "file": lib.path,
+        "header": lib.header.header_string,
+        "declared_count": lib.declared_count,
+        "storage_count": len(lib.storage_names),
+        "components": components,
+    }
+
+
+def _emit_json(obj) -> None:
+    print(json.dumps(obj, indent=2))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -205,6 +258,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-s", "--show", metavar="NAME",
                         help="Show one component's fields/parameters by name "
                              "(LibReference or storage name) and exit.")
+    parser.add_argument("--json", action="store_true",
+                        help="Emit machine-readable JSON on stdout (a single "
+                             "component with --show, else the whole library) "
+                             "and skip the human-readable banner/verification.")
     args = parser.parse_args(argv)
 
     path = args.path or find_default_schlib()
@@ -212,6 +269,18 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"File not found: {path}")
 
     with SchLib(path) as lib:
+        # JSON mode: clean machine-readable output, no banner/verification.
+        if args.json:
+            if args.show is not None:
+                if not lib.has_component(args.show):
+                    _emit_json({"found": False, "query": args.show,
+                                "suggestions": _suggest(lib, args.show)})
+                    return 1
+                _emit_json(component_to_dict(lib.get_component(args.show)))
+            else:
+                _emit_json(library_to_dict(lib))
+            return 0
+
         # Query mode: show a single component and skip listing/verification.
         if args.show is not None:
             print_library_info(lib)

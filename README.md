@@ -75,6 +75,22 @@ python list_components.py --show CON_KLEMA_2
 An unknown name exits non-zero and prints close matches (case-insensitive
 substring), e.g. `--show klema` suggests the `CON_KLEMA_*` family.
 
+### JSON output
+
+Add `--json` for machine-readable output (skips the banner/verification):
+
+```bash
+python list_components.py --show CON_KLEMA_2 --json   # one component
+python list_components.py --json                      # whole library
+python list_components.py --json | jq '.components | length'
+```
+
+With `--show`, the object has `name`, `storage_name`, `design_item_id`,
+`description`, `part_count`, `pin_count`, `header` (all RECORD=1 fields),
+`parameters` (`[{name, text}]`), and `record_breakdown`. A missing name emits
+`{"found": false, "query": ..., "suggestions": [...]}` and exits non-zero.
+Without `--show`, it emits the library summary plus a `components` array.
+
 ## Library usage
 
 ```python

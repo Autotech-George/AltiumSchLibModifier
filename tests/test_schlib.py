@@ -344,6 +344,45 @@ def test_cli_show_missing_component_suggests(capsys):
 
 
 @needs_sample
+def test_cli_json_single_component(capsys):
+    import json
+
+    import list_components as cli
+
+    assert cli.main(["--show", "CON_KLEMA_2", "--json"]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["name"] == "CON_KLEMA_2"
+    assert doc["pin_count"] == 2
+    assert doc["header"]["LibReference"] == "CON_KLEMA_2"
+    assert {"name": "Comment", "text": "VAL?"} in doc["parameters"]
+
+
+@needs_sample
+def test_cli_json_library(capsys):
+    import json
+
+    import list_components as cli
+
+    assert cli.main(["--json"]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["declared_count"] == 714
+    assert len(doc["components"]) == 714
+    names = {c["name"] for c in doc["components"]}
+    assert {f"CON_KLEMA_{n}" for n in range(2, 13)} <= names
+
+
+@needs_sample
+def test_cli_json_not_found(capsys):
+    import json
+
+    import list_components as cli
+
+    assert cli.main(["--show", "does-not-exist", "--json"]) == 1
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["found"] is False
+
+
+@needs_sample
 def test_len_matches_component_names(lib):
     assert len(lib) == len(lib.component_names)
     assert lib.declared_count == 714
