@@ -7,8 +7,8 @@ Quick start::
     with SchLib("input/lib.SchLib") as lib:
         for name in lib.component_names:
             print(name)
-        comp = lib.get_component("CON_KLEMA_2")
-        comp.set_header_field("ComponentDescription", "2-pin terminal block")
+        comp = lib.get_component(lib.component_names[0])
+        comp.set_header_field("ComponentDescription", "updated description")
         lib.save("output/lib.SchLib")
 """
 

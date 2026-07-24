@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""Parse an Altium .SchLib file, list its components, and verify a known set.
+"""Parse an Altium .SchLib file, list its components, and self-check the parse.
 
-This is the acceptance test for the ``altium_schlib`` parser. It:
+This is the acceptance program for the ``altium_schlib`` parser. It:
 
   1. Opens a .SchLib (given on the command line, or auto-discovered in ./input).
-  2. Prints library metadata and every component it finds.
-  3. Verifies the expected connector family CON_KLEMA_2 .. CON_KLEMA_12
-     (11 components) is present -- and that the unrelated CON_KLEMA_20 is
-     *not* mistaken for one of them.
+  2. Prints library metadata and the components it finds.
+  3. Runs a name-agnostic self-check: every declared component resolves to a
+     distinct OLE storage, and every Data stream round-trips byte-for-byte
+     through the parser.
 
-Exit code is 0 when the verification passes, 1 otherwise.
+Use --match to search for components and --show to inspect one.
+Exit code is 0 when the self-check passes, 1 otherwise.
 
 Usage::
 
     python list_components.py                    # auto-find in ./input
     python list_components.py path/to/lib.SchLib
     python list_components.py --limit 40         # cap the component listing
+    python list_components.py --match CONN       # search names
+    python list_components.py --show SOME_PART   # inspect one component
 """
 
 from __future__ import annotations
@@ -29,10 +32,7 @@ import sys
 # Make the package importable when run directly from the repo root.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from altium_schlib import SchLib  # noqa: E402
-
-# The connector family the user asked us to confirm: CON_KLEMA_2 .. CON_KLEMA_12.
-EXPECTED_KLEMA = [f"CON_KLEMA_{n}" for n in range(2, 13)]  # 11 names
+from altium_schlib import SchLib, parse_records, serialize_records  # noqa: E402
 
 
 def find_default_schlib() -> str:
@@ -89,42 +89,47 @@ def list_components(lib: SchLib, limit: int | None) -> None:
     print()
 
 
-def verify_klema(lib: SchLib) -> bool:
+def verify_library(lib: SchLib) -> bool:
+    """Name-agnostic self-check: unique name->storage resolution + round-trip."""
     print("=" * 72)
-    print("Verification: CON_KLEMA_2 .. CON_KLEMA_12  (expect 11 components)")
+    print("Self-check: name resolution + Data-stream round-trip")
     print("=" * 72)
-    found = []
-    for name in EXPECTED_KLEMA:
-        present = lib.has_component(name)
-        if present:
-            comp = lib.get_component(name)
-            # Confirm the resolved component's real name matches exactly,
-            # so CON_KLEMA_2 is never satisfied by e.g. CON_KLEMA_20.
-            ok = comp.name == name
-            found.append(name if ok else None)
-            mark = "OK " if ok else "!! "
-            extra = "" if ok else f"  (resolved to {comp.name!r}!)"
-            print(f"  [{mark}] {name:<16} {comp.pin_count} pins{extra}")
+
+    names = lib.component_names
+    unresolved = []
+    used: dict = {}
+    for name in names:
+        storage = lib.storage_name_for(name)
+        if storage is None:
+            unresolved.append(name)
         else:
-            found.append(None)
-            print(f"  [MISS] {name:<16} not found")
+            used.setdefault(storage, []).append(name)
+    collisions = {k: v for k, v in used.items() if len(v) > 1}
 
-    found_count = sum(1 for f in found if f)
-    print("-" * 72)
-    print(f"  Found {found_count} of {len(EXPECTED_KLEMA)} expected components.")
+    roundtrip_fail = []
+    for storage in lib.storage_names:
+        raw = lib._read_stream([storage, "Data"])
+        if serialize_records(parse_records(raw)) != raw:
+            roundtrip_fail.append(storage)
 
-    # Sanity check: CON_KLEMA_20 exists in this library but must stay distinct
-    # from the 2..12 range (guards against a prefix-matching regression).
-    if lib.has_component("CON_KLEMA_20"):
-        distinct = lib.get_component("CON_KLEMA_20").name == "CON_KLEMA_20"
-        print(f"  Note: CON_KLEMA_20 also exists and resolves "
-              f"{'distinctly' if distinct else 'INCORRECTLY'} "
-              "(not counted in the range).")
+    n_store = len(lib.storage_names)
+    print(f"  Declared components    : {len(names)}")
+    print(f"  Resolved to a storage  : {len(names) - len(unresolved)} / {len(names)}")
+    print(f"  Distinct storages used : {len(used)}")
+    print(f"  Data round-trips exact : {n_store - len(roundtrip_fail)} / {n_store}")
 
-    passed = found_count == len(EXPECTED_KLEMA)
+    if unresolved:
+        print(f"  ! unresolved names    : {unresolved[:5]}"
+              + (" ..." if len(unresolved) > 5 else ""))
+    if collisions:
+        print(f"  ! storage collisions  : {list(collisions)[:5]}")
+    if roundtrip_fail:
+        print(f"  ! round-trip failures : {roundtrip_fail[:5]}")
+
+    passed = not unresolved and not collisions and not roundtrip_fail
     print()
-    print("RESULT: " + ("PASS - all 11 CON_KLEMA components found."
-                        if passed else "FAIL - missing components (see above)."))
+    print("RESULT: " + ("PASS - all components resolve uniquely and round-trip."
+                        if passed else "FAIL - see issues above."))
     print()
     return passed
 
@@ -358,7 +363,7 @@ def main(argv: list[str] | None = None) -> int:
         print_library_info(lib)
         if not args.no_list:
             list_components(lib, None if args.limit == 0 else args.limit)
-        passed = verify_klema(lib)
+        passed = verify_library(lib)
 
     return 0 if passed else 1
 

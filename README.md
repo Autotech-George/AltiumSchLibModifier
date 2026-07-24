@@ -10,8 +10,8 @@ losslessly (only the bytes you actually changed change).
 ## Status
 
 - ✅ Parse the compound-file container and enumerate all components
-- ✅ Byte-exact round-trip of every component's record stream (verified on 714/714,
-  including the 817 records that contain empty `||` fields)
+- ✅ Byte-exact round-trip of every component's record stream (verified across a
+  full production library, including records that contain empty `||` fields)
 - ✅ Resolve component names ↔ OLE storage names (handles truncation & sanitization)
 - ✅ Edit component header fields / parameters in memory
 - ✅ **Atomic** save to a new `.SchLib` (temp file + rename) preserving structure
@@ -45,21 +45,22 @@ pip install -r requirements.txt
 
 ## Quick start
 
-Run the acceptance/test program against the sample library in `input/`:
+Drop a `.SchLib` into `input/` and run the acceptance program:
 
 ```bash
 python list_components.py
 ```
 
-It prints the library metadata, lists components, and verifies the
-`CON_KLEMA_2 … CON_KLEMA_12` family (11 components) is present. Exit code is `0`
-on success.
+It prints the library metadata, lists components, and runs a name-agnostic
+self-check: every declared component resolves to a distinct OLE storage and
+every `Data` stream round-trips byte-for-byte through the parser. Exit code is
+`0` on success.
 
 Useful flags:
 
 ```bash
-python list_components.py --limit 0        # list all 714 components
-python list_components.py --no-list        # verification only
+python list_components.py --limit 0        # list all components
+python list_components.py --no-list        # self-check only
 python list_components.py path/to/lib.SchLib
 ```
 
@@ -69,8 +70,8 @@ Not sure of the exact name? `--match` lists every component whose name contains
 a substring (case-insensitive), then pick one to inspect with `--show`:
 
 ```bash
-python list_components.py --match KLEMA        # lists CON_KLEMA_2 .. _12, _20
-python list_components.py --show CON_KLEMA_5    # then inspect the one you want
+python list_components.py --match CONN         # e.g. list connector symbols
+python list_components.py --show <PART_NAME>   # then inspect the one you want
 ```
 
 `--match` exits non-zero if nothing matches, and honours `--json` (emitting
@@ -82,18 +83,18 @@ Query a single component by name (its `LibReference` or raw storage name) to see
 its header fields, parameters, and record breakdown:
 
 ```bash
-python list_components.py --show CON_KLEMA_2
+python list_components.py --show <PART_NAME>
 ```
 
 An unknown name exits non-zero and prints close matches (case-insensitive
-substring), e.g. `--show klema` suggests the `CON_KLEMA_*` family.
+substring), so a partial name points you at the full one.
 
 ### JSON output
 
-Add `--json` for machine-readable output (skips the banner/verification):
+Add `--json` for machine-readable output (skips the banner/self-check):
 
 ```bash
-python list_components.py --show CON_KLEMA_2 --json   # one component
+python list_components.py --show <PART_NAME> --json   # one component
 python list_components.py --json                      # whole library
 python list_components.py --json | jq '.components | length'
 ```
@@ -109,17 +110,17 @@ Without `--show`, it emits the library summary plus a `components` array.
 ```python
 from altium_schlib import SchLib
 
-with SchLib("input/01_AD_Schematic_Library_24_09_2021.SchLib") as lib:
-    print(len(lib), "components")            # 714
+with SchLib("input/library.SchLib") as lib:
+    print(len(lib), "components")
     for name in lib.component_names:
         print(name)
 
-    comp = lib.get_component("CON_KLEMA_2")
+    comp = lib.get_component(lib.component_names[0])   # or a name you know
     print(comp.name, comp.pin_count, comp.description)
 
     # Edit a header field and a parameter, then save a copy.
-    comp.set_header_field("ComponentDescription", "2-way terminal block")
-    comp.set_parameter("Value", "5.08mm")     # returns False if no such param
+    comp.set_header_field("ComponentDescription", "updated description")
+    comp.set_parameter("Value", "10k")        # returns False if no such param
     lib.save("output/edited.SchLib")
 ```
 
@@ -189,10 +190,11 @@ resolves to exactly one storage.
 pytest -q
 ```
 
-The suite covers record-framing unit round-trips, the `CON_KLEMA` acceptance
-check, byte-exact round-trip of all 714 component streams, bijective name
-resolution, lossless save, and isolated-edit save. Sample-dependent tests skip
-if `input/*.SchLib` is absent; save tests skip without `pywin32`.
+The suite covers record-framing unit round-trips, byte-exact round-trip of every
+component stream, bijective name resolution, lossless save, and isolated-edit
+save. It hard-codes no component names — sample-dependent tests discover their
+subjects from whatever library is in `input/`, and skip if none is present; save
+tests skip without `pywin32`.
 
 ## Project layout
 
@@ -201,7 +203,7 @@ altium_schlib/          the library package
     records.py          record framing + text-record parse/serialize
     schlib.py           SchLib / Component / LibraryHeader
     writer.py           compound-file writer (native Structured Storage)
-list_components.py      acceptance/test program (lists + verifies CON_KLEMA)
+list_components.py      acceptance program (list / search / show / self-check)
 tests/test_schlib.py    pytest suite
 input/                  source .SchLib libraries
 output/                 written libraries (git-ignored)
