@@ -647,6 +647,57 @@ def test_ensure_parameter_skips_existing():
     assert comp.get_parameter("Mount") == "old"  # not overwritten
 
 
+def _owner_links(comp):
+    """{child UniqueID -> owner UniqueID} for every OwnerIndex-bearing record."""
+    recs = comp.records
+    links = {}
+    for r in recs:
+        if not r.is_text:
+            continue
+        oi = r.get("OwnerIndex")
+        if oi is None:
+            continue
+        owner = recs[int(oi)] if 0 <= int(oi) < len(recs) else None
+        links[r.get("UniqueID")] = owner.get("UniqueID") if owner else None
+    return links
+
+
+def test_add_parameter_preserves_owner_index_links():
+    """Regression: inserting a record must not break positional OwnerIndex
+    references (footprint/model implementations own child records by index)."""
+    comp = _make_component([
+        b"|RECORD=1|LibReference=X\x00",                            # 0
+        b"|RECORD=41|Name=.PCBChecked|UniqueID=PCBCHKAA\x00",       # 1 (cluster)
+        b"|RECORD=44|UniqueID=IMPLLIST\x00",                        # 2 owner list
+        b"|RECORD=45|OwnerIndex=2|ModelName=FP|ModelType=PCBLIB"
+        b"|UniqueID=IMPLXXXX\x00",                                  # 3 -> owns via 2
+        b"|RECORD=46|OwnerIndex=3|UniqueID=DATAFILE\x00",           # 4 -> owns via 3
+        b"|RECORD=48|OwnerIndex=3|UniqueID=DPARMXXX\x00",           # 5 -> owns via 3
+    ])
+    before = _owner_links(comp)
+    comp.add_parameter("Mount", "Surface Mount")
+    after = _owner_links(comp)
+    # Same child->owner identity mapping despite the shifted indices.
+    assert after == before
+    # And concretely: the footprint implementation still owns its children.
+    r45 = next(r for r in comp.records if r.is_text and r.record_id == 45)
+    assert comp.records[int(r45.get("OwnerIndex"))].record_id == 44
+    assert r45.get("ModelName") == "FP"  # untouched footprint link
+
+
+@needs_sample
+def test_add_parameter_preserves_owner_links_on_sample(lib):
+    """On a real component with implementations, ownership survives the add."""
+    target = next((n for n in lib.component_names
+                   if _owner_links(lib.get_component(n))), None)
+    if target is None:
+        pytest.skip("no component uses OwnerIndex")
+    comp = lib.get_component(target)
+    before = _owner_links(comp)
+    comp.add_parameter("ZZ_OWNERCHK", "V")
+    assert _owner_links(comp) == before
+
+
 # -- integration against the sample -----------------------------------------
 @needs_sample
 def test_add_parameter_to_all_covers_everything(lib):

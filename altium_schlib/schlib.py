@@ -308,6 +308,25 @@ class Component:
         while (i < len(self.records) and self.records[i].is_text
                and self.records[i].record_id == 41):
             i += 1
+
+        # Inserting at position i shifts every later record up by one.
+        # OwnerIndex is a positional reference (a child record points to its
+        # owner's index in this list -- e.g. a footprint/model implementation
+        # RECORD=45 owns RECORD=46/48). Bump every reference to a shifted record
+        # so those ownership links survive the insertion.
+        for r in self.records:
+            if not r.is_text:
+                continue
+            oi = r.get("OwnerIndex")
+            if oi is None:
+                continue
+            try:
+                v = int(oi)
+            except ValueError:
+                continue
+            if v >= i:
+                r.set("OwnerIndex", str(v + 1))
+
         self.records.insert(i, rec)
         return rec
 
