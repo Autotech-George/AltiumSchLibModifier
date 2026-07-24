@@ -21,6 +21,8 @@ substituted (see :mod:`altium_schlib.writer`).
 
 from __future__ import annotations
 
+import random
+import string
 import struct
 from typing import Dict, List, Optional, Tuple
 
@@ -44,6 +46,20 @@ def _parse_pipe_fields(data: bytes) -> List[Tuple[str, str]]:
         key, sep, value = chunk.partition("=")
         fields.append((key, value) if sep else (chunk, ""))
     return fields
+
+
+_UID_ALPHABET = string.ascii_uppercase  # Altium UniqueIDs are 8 chars, A-Z only
+_UID_LEN = 8
+
+
+def _new_unique_id(existing, rng=None) -> str:
+    """A fresh 8-char A-Z UniqueID not present in ``existing``."""
+    source = rng or random
+    for _ in range(10000):
+        uid = "".join(source.choice(_UID_ALPHABET) for _ in range(_UID_LEN))
+        if uid not in existing:
+            return uid
+    raise RuntimeError("exhausted attempts generating a unique UniqueID")  # pragma: no cover
 
 
 class LibraryHeader:
@@ -188,6 +204,111 @@ class Component:
                 r.set("Text", text)
                 return True
         return False
+
+    def has_parameter(self, name: str) -> bool:
+        """True if a parameter with this ``Name`` exists (value or not)."""
+        return any(r.get("Name") == name for r in self.parameters)
+
+    @staticmethod
+    def _validate_param_field(kind: str, value: str, *, allow_equals: bool) -> None:
+        if "|" in value or "\x00" in value:
+            raise ValueError(f"parameter {kind} may not contain '|' or NUL")
+        if not allow_equals and "=" in value:
+            raise ValueError(f"parameter {kind} may not contain '='")
+        if not value.isascii():
+            raise ValueError(
+                f"parameter {kind} must be ASCII; non-ASCII text needs Altium's "
+                f"%UTF8% dual-encoding, which is not yet supported"
+            )
+
+    def add_parameter(self, name: str, value: str, *, hidden: bool = True,
+                      rng=None) -> Record:
+        """Create a new RECORD=41 parameter and insert it into the component.
+
+        Geometry (Location/FontID/Color) is cloned from an existing parameter so
+        the new record looks native; a fresh component-unique UniqueID is
+        generated. Does not check for an existing parameter of the same name --
+        use :meth:`ensure_parameter` for the idempotent add.
+        """
+        name = str(name)
+        value = str(value)
+        self._validate_param_field("name", name, allow_equals=False)
+        self._validate_param_field("value", value, allow_equals=True)
+
+        params = self.parameters
+        # Prefer cloning a hidden data parameter (not the special "Comment").
+        src = next((r for r in params
+                    if r.get("IsHidden") == "T" and r.get("Name") != "Comment"),
+                   None)
+        if src is None and params:
+            src = params[0]  # e.g. components whose only param is "Comment"
+        if src is not None:
+            loc_x = src.get("Location.X", "-5")
+            loc_y = src.get("Location.Y", "13")
+            font_id = src.get("FontID", "1")
+            color = src.get("Color", "8388608")
+            owner = src.get("OwnerPartId", "-1")
+        else:  # component with no parameters at all
+            loc_x, loc_y, font_id, color, owner = "-5", "13", "1", "8388608", "-1"
+
+        # IndexInSheet is a component-wide ordinal; take one past the current max.
+        indices = []
+        for r in self.records:
+            v = r.get("IndexInSheet") if r.is_text else None
+            if v is not None:
+                try:
+                    indices.append(int(v))
+                except ValueError:
+                    pass
+        index_in_sheet = (max(indices) + 1) if indices else 0
+
+        existing_uids = {r.get("UniqueID") for r in self.records
+                         if r.get("UniqueID") is not None}
+        unique_id = _new_unique_id(existing_uids, rng)
+
+        pairs = [
+            ("RECORD", "41"),
+            ("IndexInSheet", str(index_in_sheet)),
+            ("OwnerPartId", owner),
+            ("Location.X", loc_x),
+            ("Location.Y", loc_y),
+            ("Color", color),
+            ("FontID", font_id),
+        ]
+        if hidden:
+            pairs.append(("IsHidden", "T"))
+        pairs.append(("Text", value))
+        pairs.append(("Name", name))
+        pairs.append(("UniqueID", unique_id))
+        rec = Record.from_fields(pairs)
+
+        # Insert at the end of the contiguous RECORD=41 cluster that follows the
+        # component header (before the graphics records); for components with no
+        # leading cluster this lands right after the header.
+        header = self.header
+        start = 0
+        if header is not None:
+            for i, r in enumerate(self.records):
+                if r is header:
+                    start = i + 1
+                    break
+        i = start
+        while (i < len(self.records) and self.records[i].is_text
+               and self.records[i].record_id == 41):
+            i += 1
+        self.records.insert(i, rec)
+        return rec
+
+    def ensure_parameter(self, name: str, value: str, *, hidden: bool = True,
+                         rng=None) -> bool:
+        """Add the parameter only if absent. Returns True if it was added.
+
+        Never overwrites an existing parameter of the same name (any value).
+        """
+        if self.has_parameter(name):
+            return False
+        self.add_parameter(name, value, hidden=hidden, rng=rng)
+        return True
 
     # -- editing -------------------------------------------------------------
     # Fields that also appear in the library-level FileHeader/SectionKeys and in
@@ -406,6 +527,31 @@ class SchLib:
 
     def __iter__(self):
         return iter(self.components)
+
+    # -- batch editing -------------------------------------------------------
+    def add_parameter_to_all(self, name: str, value: str, *, hidden: bool = True,
+                             rng=None) -> dict:
+        """Add parameter ``name``=``value`` to every component that lacks it.
+
+        Idempotent: components that already have the parameter are left
+        untouched. Does not save -- the caller writes the result with
+        :meth:`save`. Returns a summary dict with ``added``/``skipped`` name
+        lists and their counts plus ``total``.
+        """
+        added: List[str] = []
+        skipped: List[str] = []
+        for comp in self.components:
+            if comp.ensure_parameter(name, value, hidden=hidden, rng=rng):
+                added.append(comp.name)
+            else:
+                skipped.append(comp.name)
+        return {
+            "added": added,
+            "skipped": skipped,
+            "added_count": len(added),
+            "skipped_count": len(skipped),
+            "total": len(added) + len(skipped),
+        }
 
     # -- saving --------------------------------------------------------------
     def _build_stream_tree(self) -> dict:

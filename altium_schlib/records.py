@@ -138,6 +138,23 @@ class Record:
         if flag == FLAG_TEXT:
             self._chunks, self._had_null = parse_text_payload(payload)
 
+    @classmethod
+    def from_fields(cls, pairs, *, had_null: bool = True) -> "Record":
+        """Synthesize a new (dirty) text record from ordered ``(key, value)`` pairs.
+
+        For records that did not exist in the source (e.g. a new parameter). The
+        leading ``""`` chunk reproduces the leading ``|``; the record is marked
+        dirty so :attr:`payload` serializes it via :func:`serialize_text_payload`
+        to ``|k=v|k=v|...\\x00`` -- byte-identical to an equivalent parsed record.
+        """
+        rec = object.__new__(cls)
+        rec.flag = FLAG_TEXT
+        rec._raw = b""
+        rec._chunks = [""] + [f"{key}={value}" for key, value in pairs]
+        rec._had_null = had_null
+        rec._dirty = True
+        return rec
+
     # -- introspection -------------------------------------------------------
     @property
     def is_text(self) -> bool:

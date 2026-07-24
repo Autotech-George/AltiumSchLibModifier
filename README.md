@@ -14,6 +14,8 @@ losslessly (only the bytes you actually changed change).
   full production library, including records that contain empty `||` fields)
 - ✅ Resolve component names ↔ OLE storage names (handles truncation & sanitization)
 - ✅ Edit component header fields / parameters in memory
+- ✅ **Batch-add a parameter** to every component that lacks it (e.g. `Mount`
+  for pick-and-place) — see `batch_add_parameter.py`
 - ✅ **Atomic** save to a new `.SchLib` (temp file + rename) preserving structure
   and Altium's CLSID; in-place `save(same_path)` supported
 
@@ -104,6 +106,48 @@ With `--show`, the object has `name`, `storage_name`, `design_item_id`,
 `parameters` (`[{name, text}]`), and `record_breakdown`. A missing name emits
 `{"found": false, "query": ..., "suggestions": [...]}` and exits non-zero.
 Without `--show`, it emits the library summary plus a `components` array.
+
+## Batch-add a parameter (`batch_add_parameter.py`)
+
+Add a parameter (name + default value) to **every component that doesn't
+already have it** — for example a `Mount` parameter that pick-and-place tooling
+reads. Components that already carry the parameter are left untouched (their
+values are never overwritten).
+
+```bash
+# Preview only — writes nothing:
+python batch_add_parameter.py --name Mount --value "Surface Mount" --dry-run
+
+# Add to all missing, writing a NEW file into ./output (input untouched):
+python batch_add_parameter.py --name Mount --value "Surface Mount"
+
+# Explicit output, or edit the source in place (atomic):
+python batch_add_parameter.py --name Mount --value "Surface Mount" -o out.SchLib
+python batch_add_parameter.py --name Mount --value "Surface Mount" --in-place
+```
+
+- **Safe by default**: writes `output/<input-name>.SchLib` and refuses to
+  overwrite the input unless `--in-place` is given.
+- **Visibility**: the parameter is added hidden by default (matching a normal
+  machine parameter); use `--visible` / `--hidden` to force it.
+- `--json` prints a summary (`added_count`, `skipped_count`, `total`, `output`).
+- Only the modified components' `Data` streams change; everything else stays
+  byte-identical, and re-running is idempotent.
+- Values must currently be ASCII (Altium's `%UTF8%` dual-encoding for non-ASCII
+  parameter text is not yet emitted). Saving requires `pywin32` (Windows).
+
+Programmatically:
+
+```python
+with SchLib("input/library.SchLib") as lib:
+    summary = lib.add_parameter_to_all("Mount", "Surface Mount")  # hidden=True
+    print(summary["added_count"], "added,", summary["skipped_count"], "skipped")
+    lib.save("output/library.SchLib")
+```
+
+`Component` also exposes `add_parameter(name, value, hidden=True)`,
+`ensure_parameter(name, value)` (add only if absent → bool), and
+`has_parameter(name)`.
 
 ## Library usage
 
@@ -204,6 +248,7 @@ altium_schlib/          the library package
     schlib.py           SchLib / Component / LibraryHeader
     writer.py           compound-file writer (native Structured Storage)
 list_components.py      acceptance program (list / search / show / self-check)
+batch_add_parameter.py  batch add a parameter to all components missing it
 tests/test_schlib.py    pytest suite
 input/                  source .SchLib libraries
 output/                 written libraries (git-ignored)

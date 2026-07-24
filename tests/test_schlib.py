@@ -540,3 +540,193 @@ def test_in_place_save_is_atomic(tmp_path):
     after, _ = _stream_map(work)
     changed = [k for k in before if before[k] != after.get(k)]
     assert changed == [(storage, "Data")], changed
+
+
+# --------------------------------------------------------------------------
+# Batch add-parameter feature
+# --------------------------------------------------------------------------
+import random  # noqa: E402
+import string  # noqa: E402
+
+from altium_schlib.schlib import Component, _new_unique_id  # noqa: E402
+
+# A parameter name no real library component is expected to carry.
+TESTPARAM = "ZZ_TESTPARAM"
+
+
+def _make_component(payloads, storage="X"):
+    data = b"".join(serialize_record_block(0, p) for p in payloads)
+    return Component(storage, data)
+
+
+# -- unit: record factory + UniqueID (no sample) ----------------------------
+def test_record_from_fields_bytes_and_dirty():
+    r = Record.from_fields([("RECORD", "41"), ("Name", "Mount"), ("Text", "X")])
+    assert r.is_text and r.dirty and r.record_id == 41
+    assert r.get("Name") == "Mount"
+    assert r.to_bytes()[4:] == b"|RECORD=41|Name=Mount|Text=X\x00"
+    # A synthesized record is byte-identical to the equivalent parsed one.
+    assert parse_records(r.to_bytes())[0].to_bytes() == r.to_bytes()
+
+
+def test_new_unique_id_format_and_retry():
+    uid = _new_unique_id(set())
+    assert len(uid) == 8 and uid.isalpha() and uid.isupper()
+    # Force a collision: the first candidate from seed 1 is already taken, so
+    # the generator must retry and return a different id.
+    rng = random.Random(1)
+    first = "".join(rng.choice(string.ascii_uppercase) for _ in range(8))
+    out = _new_unique_id({first}, random.Random(1))
+    assert out != first and len(out) == 8
+
+
+# -- unit: add_parameter behavior (no sample) -------------------------------
+def test_add_parameter_clones_and_inserts_in_cluster():
+    comp = _make_component([
+        b"|RECORD=1|LibReference=X|AllPinCount=0\x00",
+        b"|RECORD=41|IndexInSheet=1|OwnerPartId=-1|Location.X=-5|Location.Y=13"
+        b"|Color=8388608|FontID=11|IsHidden=T|Text=A|Name=P1|UniqueID=AAAAAAAA\x00",
+        b"|RECORD=6|X=1\x00",  # a non-param record after the cluster
+    ])
+    rec = comp.add_parameter("Mount", "Surface Mount", rng=random.Random(0))
+    f = dict(rec.fields)
+    assert f["Name"] == "Mount" and f["Text"] == "Surface Mount"
+    assert f["IsHidden"] == "T"
+    assert f["Location.X"] == "-5" and f["FontID"] == "11"  # cloned from sibling
+    assert len(f["UniqueID"]) == 8 and f["UniqueID"] != "AAAAAAAA"
+    # Inserted at the end of the leading RECORD=41 cluster (before RECORD=6).
+    assert [r.record_id for r in comp.records] == [1, 41, 41, 6]
+
+
+def test_add_parameter_visible_omits_ishidden():
+    comp = _make_component([b"|RECORD=1|LibReference=X\x00"])
+    rec = comp.add_parameter("V", "x", hidden=False)
+    assert "IsHidden" not in dict(rec.fields)
+
+
+def test_add_parameter_empty_cluster_inserts_after_header():
+    # Only parameter is a late "Comment"; leading cluster is empty.
+    comp = _make_component([
+        b"|RECORD=1|LibReference=X\x00",
+        b"|RECORD=34|Name=Designator|Text=U?|UniqueID=BBBBBBBB\x00",
+        b"|RECORD=41|IndexInSheet=-1|OwnerPartId=-1|Location.X=0|Location.Y=5"
+        b"|Color=8388608|FontID=14|Text=c|Name=Comment|UniqueID=CCCCCCCC\x00",
+    ])
+    rec = comp.add_parameter("Mount", "SM")
+    assert [r.record_id for r in comp.records] == [1, 41, 34, 41]
+    f = dict(rec.fields)
+    assert f["IsHidden"] == "T"          # hidden even though Comment isn't
+    assert f["Color"] == "8388608"        # geometry cloned from the Comment param
+
+
+def test_add_parameter_rejects_bad_input():
+    comp = _make_component([b"|RECORD=1|LibReference=X\x00"])
+    for bad in ["a|b", "a\x00b"]:
+        with pytest.raises(ValueError):
+            comp.add_parameter(bad, "v")
+        with pytest.raises(ValueError):
+            comp.add_parameter("N", bad)
+    with pytest.raises(ValueError):
+        comp.add_parameter("has=eq", "v")     # '=' illegal in a name
+    with pytest.raises(ValueError):
+        comp.add_parameter("N", "café")  # non-ASCII value
+    # '=' inside a value is allowed
+    rec = comp.add_parameter("N", "a=b")
+    assert rec.get("Text") == "a=b"
+
+
+def test_ensure_parameter_skips_existing():
+    comp = _make_component([
+        b"|RECORD=1|LibReference=X\x00",
+        b"|RECORD=41|OwnerPartId=-1|Location.X=0|Location.Y=0|Color=1|FontID=1"
+        b"|IsHidden=T|Text=old|Name=Mount|UniqueID=DDDDDDDD\x00",
+    ])
+    before = len(comp.records)
+    assert comp.ensure_parameter("Mount", "new") is False
+    assert len(comp.records) == before
+    assert comp.get_parameter("Mount") == "old"  # not overwritten
+
+
+# -- integration against the sample -----------------------------------------
+@needs_sample
+def test_add_parameter_to_all_covers_everything(lib):
+    summary = lib.add_parameter_to_all(TESTPARAM, "V", rng=random.Random(0))
+    assert summary["added_count"] + summary["skipped_count"] == len(lib)
+    assert summary["total"] == len(lib)
+    for name in lib.component_names:
+        assert lib.get_component(name).has_parameter(TESTPARAM)
+
+
+@needs_sample
+@needs_pywin32
+def test_batch_add_roundtrip_isolated_and_idempotent(tmp_path):
+    out1 = str(tmp_path / "p1.SchLib")
+    with SchLib(SAMPLE) as lib:
+        added = set()  # storages that will be modified (lack the param)
+        for name in lib.component_names:
+            comp = lib.get_component(name)
+            if not comp.has_parameter(TESTPARAM):
+                added.add(comp.storage_name)
+        summary = lib.add_parameter_to_all(TESTPARAM, "V", rng=random.Random(0))
+        lib.save(out1)
+
+    # every component now has it, and no component was added/removed
+    with SchLib(out1) as lib1:
+        assert len(lib1) == summary["total"]
+        for name in lib1.component_names:
+            assert lib1.get_component(name).get_parameter(TESTPARAM) == "V"
+
+    # isolated diff: only added components' Data changed; root + PinTextData intact
+    before, cb = _stream_map(SAMPLE)
+    after, ca = _stream_map(out1)
+    assert ca == cb
+    changed = {k for k in before if before[k] != after.get(k)}
+    assert changed == {(s, "Data") for s in added}
+    assert not (set(after) - set(before))  # no new/removed streams
+
+    # idempotent: re-running adds nothing and yields a byte-identical file
+    out2 = str(tmp_path / "p2.SchLib")
+    with SchLib(out1) as lib2:
+        s2 = lib2.add_parameter_to_all(TESTPARAM, "V", rng=random.Random(0))
+        assert s2["added_count"] == 0
+        lib2.save(out2)
+    a1, _ = _stream_map(out1)
+    a2, _ = _stream_map(out2)
+    assert a1 == a2
+
+
+# -- CLI --------------------------------------------------------------------
+@needs_sample
+def test_cli_batch_dry_run_writes_nothing(tmp_path, capsys):
+    import batch_add_parameter as cli
+
+    out = tmp_path / "should_not_exist.SchLib"
+    rc = cli.main(["--name", TESTPARAM, "--value", "V", "--dry-run",
+                   "-o", str(out), "--json"])
+    assert rc == 0
+    import json
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["dry_run"] is True and doc["output"] is None
+    assert doc["total"] == doc["added_count"] + doc["skipped_count"]
+    assert not out.exists()
+
+
+@needs_sample
+@needs_pywin32
+def test_cli_batch_writes_and_adds(tmp_path):
+    import batch_add_parameter as cli
+
+    out = tmp_path / "cli_out.SchLib"
+    rc = cli.main(["--name", TESTPARAM, "--value", "Surface Mount", "-o", str(out)])
+    assert rc == 0 and out.exists()
+    with SchLib(str(out)) as lib:
+        for name in lib.component_names[:20]:
+            assert lib.get_component(name).get_parameter(TESTPARAM) == "Surface Mount"
+
+
+@needs_sample
+def test_cli_batch_refuses_overwriting_input():
+    import batch_add_parameter as cli
+
+    with pytest.raises(SystemExit):
+        cli.main(["--name", TESTPARAM, "--value", "V", "-o", SAMPLE])
