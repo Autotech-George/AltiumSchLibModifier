@@ -128,6 +128,71 @@ def verify_klema(lib: SchLib) -> bool:
     return passed
 
 
+def _suggest(lib: SchLib, query: str, limit: int = 8) -> list[str]:
+    """Case-insensitive substring matches over declared + storage names."""
+    q = query.lower()
+    pool = list(dict.fromkeys(lib.component_names + lib.storage_names))
+    return [n for n in pool if q in n.lower()][:limit]
+
+
+def show_component(lib: SchLib, name: str) -> bool:
+    """Print one component's header fields, parameters, and record breakdown.
+
+    Returns True if the component was found. Accepts a LibReference or the raw
+    OLE storage name.
+    """
+    if not lib.has_component(name):
+        print(f"Component not found: {name!r}")
+        hints = _suggest(lib, name)
+        if hints:
+            print("Did you mean:")
+            for h in hints:
+                print(f"    {h}")
+        else:
+            print("(no similar names; use --limit 0 to see the full list)")
+        return False
+
+    comp = lib.get_component(name)
+    print("=" * 72)
+    print(f"Component: {comp.name}")
+    print("=" * 72)
+    print(f"  Storage name : {comp.storage_name}")
+    print(f"  DesignItemId : {comp.design_item_id}")
+    print(f"  Description  : {comp.description}")
+    print(f"  Parts        : {comp.part_count}")
+    print(f"  Pins         : {comp.pin_count}")
+    print()
+
+    header = comp.header
+    if header is not None:
+        print("Header fields (RECORD=1):")
+        for key, value in header.fields:
+            print(f"    {key} = {value}")
+        print()
+
+    params = comp.parameters
+    print(f"Parameters (RECORD=41) [{len(params)}]:")
+    if params:
+        for p in params:
+            pname = p.get("Name", "")
+            text = p.get("Text", "")
+            print(f"    {pname:<32} = {text}")
+    else:
+        print("    (none)")
+    print()
+
+    # A compact breakdown of every record type in the component.
+    counts: dict = {}
+    for r in comp.records:
+        key = f"RECORD={r.record_id}" if r.is_text else "pin (binary)"
+        counts[key] = counts.get(key, 0) + 1
+    print("Record breakdown:")
+    for key in sorted(counts):
+        print(f"    {key:<16} x {counts[key]}")
+    print()
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -137,6 +202,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="Max components to list (0 = all). Default 25.")
     parser.add_argument("--no-list", action="store_true",
                         help="Skip the component listing, only run verification.")
+    parser.add_argument("-s", "--show", metavar="NAME",
+                        help="Show one component's fields/parameters by name "
+                             "(LibReference or storage name) and exit.")
     args = parser.parse_args(argv)
 
     path = args.path or find_default_schlib()
@@ -144,6 +212,12 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"File not found: {path}")
 
     with SchLib(path) as lib:
+        # Query mode: show a single component and skip listing/verification.
+        if args.show is not None:
+            print_library_info(lib)
+            found = show_component(lib, args.show)
+            return 0 if found else 1
+
         print_library_info(lib)
         if not args.no_list:
             list_components(lib, None if args.limit == 0 else args.limit)

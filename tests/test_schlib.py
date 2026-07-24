@@ -322,6 +322,28 @@ def test_edit_record_with_empty_fields_preserves_them(tmp_path):
 
 
 @needs_sample
+def test_cli_show_component(capsys):
+    import list_components as cli
+
+    assert cli.main(["--show", "CON_KLEMA_2"]) == 0
+    out = capsys.readouterr().out
+    assert "Component: CON_KLEMA_2" in out
+    assert "LibReference = CON_KLEMA_2" in out
+    assert "Parameters (RECORD=41)" in out
+    assert "pin (binary)" in out  # record breakdown present
+
+
+@needs_sample
+def test_cli_show_missing_component_suggests(capsys):
+    import list_components as cli
+
+    assert cli.main(["--show", "klema"]) == 1  # substring, not an exact name
+    out = capsys.readouterr().out
+    assert "not found" in out
+    assert "CON_KLEMA_" in out  # suggestions listed
+
+
+@needs_sample
 def test_len_matches_component_names(lib):
     assert len(lib) == len(lib.component_names)
     assert lib.declared_count == 714

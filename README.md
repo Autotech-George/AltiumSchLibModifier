@@ -63,6 +63,18 @@ python list_components.py --no-list        # verification only
 python list_components.py path/to/lib.SchLib
 ```
 
+### Inspect one component
+
+Query a single component by name (its `LibReference` or raw storage name) to see
+its header fields, parameters, and record breakdown:
+
+```bash
+python list_components.py --show CON_KLEMA_2
+```
+
+An unknown name exits non-zero and prints close matches (case-insensitive
+substring), e.g. `--show klema` suggests the `CON_KLEMA_*` family.
+
 ## Library usage
 
 ```python
