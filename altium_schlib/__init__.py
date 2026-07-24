@@ -12,6 +12,7 @@ Quick start::
         lib.save("output/lib.SchLib")
 """
 
+from . import query
 from .records import (
     FLAG_PIN,
     FLAG_TEXT,
@@ -30,6 +31,7 @@ __all__ = [
     "serialize_records",
     "FLAG_TEXT",
     "FLAG_PIN",
+    "query",
 ]
 
 __version__ = "0.1.0"

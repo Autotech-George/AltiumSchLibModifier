@@ -730,3 +730,201 @@ def test_cli_batch_refuses_overwriting_input():
 
     with pytest.raises(SystemExit):
         cli.main(["--name", TESTPARAM, "--value", "V", "-o", SAMPLE])
+
+
+# --------------------------------------------------------------------------
+# Batch set-parameter-by-query feature
+# --------------------------------------------------------------------------
+from altium_schlib import query as q  # noqa: E402
+
+TESTPARAM2 = "ZZ_TESTPARAM2"
+
+
+def _qcomp(name, params=(), designator=None, pins=0):
+    """Synthesize a Component with a name, params [(name,text|None)], designator."""
+    payloads = [f"|RECORD=1|LibReference={name}|AllPinCount={pins}\x00".encode()]
+    for pname, ptext in params:
+        if ptext is None:
+            payloads.append(f"|RECORD=41|Name={pname}\x00".encode())
+        else:
+            payloads.append(f"|RECORD=41|Text={ptext}|Name={pname}\x00".encode())
+    if designator is not None:
+        payloads.append(f"|RECORD=34|Text={designator}|Name=Designator\x00".encode())
+    return _make_component(payloads, storage=name)
+
+
+# -- unit: value-safety guards (no sample) ----------------------------------
+def test_record_set_rejects_pipe_and_nul():
+    r = Record.from_fields([("RECORD", "41"), ("Text", "a"), ("Name", "P")])
+    for bad in ["a|b", "a\x00b"]:
+        with pytest.raises(ValueError):
+            r.set("Text", bad)
+
+
+def test_set_parameter_validates_value():
+    comp = _qcomp("X", params=[("P", "old")])
+    with pytest.raises(ValueError):
+        comp.set_parameter("P", "a|b")
+    with pytest.raises(ValueError):
+        comp.set_parameter("P", "café")  # non-ASCII
+    assert comp.set_parameter("P", "new") is True
+    assert comp.get_parameter("P") == "new"
+
+
+# -- unit: query predicates (no sample) -------------------------------------
+def test_query_name_include_exclude():
+    th = _qcomp("TH_RES_1")
+    eth = _qcomp("SMD_ETH_PHY")   # contains "TH_" as a substring of "ETH_"
+    smd = _qcomp("SMD_CAP_1")
+    pred = q.all_of(q.name_contains("TH_"), q.name_excludes("ETH_"))
+    assert pred(th) and not pred(eth) and not pred(smd)
+
+
+def test_query_name_regex_and_designator_and_pins():
+    r = _qcomp("RES_10K", designator="R?", pins=2)
+    assert q.name_regex(r"^RES_")(r)
+    assert not q.name_regex(r"^CAP_")(r)
+    assert q.designator_prefix("R")(r)
+    assert not q.designator_prefix("U")(r)
+    assert q.pins(minimum=2)(r) and q.pins(maximum=2)(r)
+    assert not q.pins(minimum=3)(r)
+
+
+def test_query_param_predicates():
+    c = _qcomp("X", params=[("Case/Package", "SOIC-8"), ("Empty", None)])
+    assert q.param_equals("Case/Package", "SOIC-8")(c)
+    assert not q.param_equals("Case/Package", "SOIC")(c)
+    assert q.param_contains("Case/Package", "SOIC")(c)
+    assert q.param_regex("Case/Package", r"SOIC-\d+")(c)
+    assert q.param_exists("Case/Package")(c)
+    assert q.param_exists("Empty")(c)          # present but value-less
+    assert q.param_missing("Nope")(c)
+    assert not q.param_missing("Case/Package")(c)
+    assert q.param_equals("Case/Package", "soic-8", ignore_case=True)(c)
+
+
+def test_query_combinators():
+    a = _qcomp("AAA")
+    assert q.always()(a)
+    assert q.all_of()(a)               # empty AND -> True
+    assert not q.any_of()(a)           # empty OR -> False
+    assert q.negate(q.name_contains("Z"))(a)
+    assert q.any_of(q.name_contains("Z"), q.name_contains("AA"))(a)
+
+
+def test_designator_property():
+    assert _qcomp("X", designator="U?").designator == "U?"
+    assert _qcomp("X").designator == ""
+
+
+# -- integration against the sample -----------------------------------------
+@needs_sample
+def test_set_parameter_where_updates_matched_only(lib):
+    pred = q.pins(minimum=2)
+    matched = {c.name for c in lib.components if pred(c)}
+    assert matched and matched != set(lib.component_names)  # a real subset
+
+    lib.add_parameter_to_all(TESTPARAM2, "OLD", rng=random.Random(0))
+    summary = lib.set_parameter_where(TESTPARAM2, "NEW", pred)
+    assert summary["matched_count"] == len(matched)
+    assert summary["updated_count"] == len(matched)
+    assert summary["unchanged_count"] == 0
+    assert summary["skipped_missing_count"] == 0
+    for name in lib.component_names:
+        expected = "NEW" if name in matched else "OLD"
+        assert lib.get_component(name).get_parameter(TESTPARAM2) == expected
+
+
+@needs_sample
+def test_set_parameter_where_skips_or_creates_missing(lib):
+    pred = q.pins(minimum=2)
+    matched = {c.name for c in lib.components if pred(c)}
+
+    # default: matched-but-missing target are skipped, nothing changes
+    s1 = lib.set_parameter_where("ZZ_NEVER", "V", pred)
+    assert s1["skipped_missing_count"] == len(matched)
+    assert s1["updated_count"] == 0 and s1["created_count"] == 0
+    assert not any(c.has_parameter("ZZ_NEVER") for c in lib.components)
+
+    # create_missing: adds it to the matched set only
+    s2 = lib.set_parameter_where("ZZ_NEVER", "V", pred, create_missing=True)
+    assert s2["created_count"] == len(matched)
+    for name in lib.component_names:
+        assert lib.get_component(name).has_parameter("ZZ_NEVER") == (name in matched)
+
+
+@needs_sample
+@needs_pywin32
+def test_set_parameter_where_roundtrip_isolated(tmp_path):
+    out = str(tmp_path / "byquery.SchLib")
+    with SchLib(SAMPLE) as lib:
+        pred = q.pins(minimum=2)
+        matched = {lib.storage_name_for(c.name)
+                   for c in lib.components if pred(c)}
+        lib.set_parameter_where(TESTPARAM2, "V", pred, create_missing=True)
+        lib.save(out)
+
+    with SchLib(out) as lib2:
+        for name in lib2.component_names:
+            comp = lib2.get_component(name)
+            if lib2.storage_name_for(name) in matched:
+                assert comp.get_parameter(TESTPARAM2) == "V"
+            else:
+                assert not comp.has_parameter(TESTPARAM2)
+
+    before, cb = _stream_map(SAMPLE)
+    after, ca = _stream_map(out)
+    assert ca == cb
+    changed = {k for k in before if before[k] != after.get(k)}
+    assert changed == {(s, "Data") for s in matched}
+
+
+# -- CLI --------------------------------------------------------------------
+@needs_sample
+def test_cli_set_dry_run_writes_nothing(tmp_path, capsys):
+    import batch_set_parameter as cli
+
+    out = tmp_path / "nope.SchLib"
+    rc = cli.main(["--set", f"{TESTPARAM2}=V", "--all", "--dry-run",
+                   "-o", str(out), "--json"])
+    assert rc == 0
+    import json
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["dry_run"] is True and doc["output"] is None
+    assert doc["matched_count"] == doc["total"]  # --all
+    assert not out.exists()
+
+
+@needs_sample
+def test_cli_set_requires_selector():
+    import batch_set_parameter as cli
+
+    with pytest.raises(SystemExit):
+        cli.main(["--set", "Mount=X"])  # no selector, no --all
+
+
+@needs_sample
+def test_cli_set_refuses_overwriting_input():
+    import batch_set_parameter as cli
+
+    with pytest.raises(SystemExit):
+        cli.main(["--set", "Mount=X", "--all", "-o", SAMPLE])
+
+
+@needs_sample
+@needs_pywin32
+def test_cli_set_writes_and_updates(tmp_path):
+    import batch_set_parameter as cli
+
+    out = tmp_path / "set_out.SchLib"
+    # name-substring selector derived from a real component (library-agnostic)
+    with SchLib(SAMPLE) as lib:
+        sub = lib.component_names[0][:4]
+    rc = cli.main(["--set", f"{TESTPARAM2}=V", "--name-contains", sub,
+                   "--create-missing", "-o", str(out)])
+    assert rc == 0 and out.exists()
+    with SchLib(str(out)) as lib2:
+        hits = [n for n in lib2.component_names if sub in n]
+        assert hits
+        for n in hits:
+            assert lib2.get_component(n).get_parameter(TESTPARAM2) == "V"

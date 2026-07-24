@@ -202,10 +202,20 @@ class Record:
         return default
 
     def set(self, key: str, value: str) -> None:
-        """Set (or append) a field's value, marking the record dirty."""
+        """Set (or append) a field's value, marking the record dirty.
+
+        Rejects ``|`` and NUL in the key or value: both are structural
+        delimiters of the pipe-format, so allowing them would silently corrupt
+        the record on serialization (the value would split into extra fields).
+        """
         if self._chunks is None:
             raise TypeError("cannot set fields on a binary record")
         value = str(value)
+        for part, label in ((key, "key"), (value, "value")):
+            if "|" in part or "\x00" in part:
+                raise ValueError(f"record field {label} may not contain '|' or NUL")
+        if "=" in key:
+            raise ValueError("record field key may not contain '='")
         new_chunk = f"{key}={value}"
         for i, chunk in enumerate(self._chunks):
             k, v = _split_chunk(chunk)

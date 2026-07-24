@@ -16,6 +16,9 @@ losslessly (only the bytes you actually changed change).
 - ✅ Edit component header fields / parameters in memory
 - ✅ **Batch-add a parameter** to every component that lacks it (e.g. `Mount`
   for pick-and-place) — see `batch_add_parameter.py`
+- ✅ **Batch-set a parameter by query** — set a parameter's value on components
+  matching a composable query (name / parameter / designator / pins) — see
+  `batch_set_parameter.py`
 - ✅ **Atomic** save to a new `.SchLib` (temp file + rename) preserving structure
   and Altium's CLSID; in-place `save(same_path)` supported
 
@@ -149,6 +152,68 @@ with SchLib("input/library.SchLib") as lib:
 `ensure_parameter(name, value)` (add only if absent → bool), and
 `has_parameter(name)`.
 
+## Batch-set a parameter by query (`batch_set_parameter.py`)
+
+Set a target parameter's value on the components a **query** selects. Always
+preview with `--dry-run` first — it lists exactly which components match.
+
+```bash
+# Through-hole parts: name contains TH_ but not ETH_  (preview first)
+python batch_set_parameter.py --set Mount="Through Hole" \
+    --name-contains TH_ --name-excludes ETH_ --dry-run
+python batch_set_parameter.py --set Mount="Through Hole" \
+    --name-contains TH_ --name-excludes ETH_
+
+# SOIC parts, selected by a parameter value:
+python batch_set_parameter.py --set Mount="Surface Mount" --param "Case/Package=SOIC"
+```
+
+**Selectors** (combined with AND by default; `--match-any` switches to OR;
+`--ignore-case` for text matches):
+
+| Flag | Selects components where… |
+|---|---|
+| `--name-contains SUB` | name contains SUB (repeatable → any-of) |
+| `--name-excludes SUB` | name contains none of these |
+| `--name-regex RE` | name matches regex RE |
+| `--param NAME=VALUE` | parameter NAME text equals VALUE |
+| `--param-contains NAME=SUB` | parameter NAME text contains SUB |
+| `--param-regex NAME=RE` | parameter NAME text matches RE |
+| `--param-exists NAME` / `--param-missing NAME` | has / lacks parameter NAME |
+| `--designator-prefix P` | designator starts with P (e.g. `R`, `U`) |
+| `--pins-min N` / `--pins-max N` | pin count in range |
+| `--all` | every component (required to match all) |
+
+Behaviour:
+
+- **Preview**: `--dry-run` lists matches and writes nothing (`--limit N` caps the
+  list). At least one selector (or `--all`) is required — it refuses an implicit
+  match-all.
+- **Missing target**: a matched component that doesn't yet have the target
+  parameter is **skipped and reported** by default; pass `--create-missing` to
+  add it (hidden) instead.
+- **Safe & surgical**: writes `output/<input-name>.SchLib` (never clobbers the
+  input unless `--in-place`); only the changed components' `Data` streams differ;
+  re-running is idempotent. `--json` emits the summary. Values are ASCII-only
+  (same limitation as add); saving needs `pywin32`.
+
+Programmatically, build a predicate with `altium_schlib.query` and apply it:
+
+```python
+from altium_schlib import SchLib, query as q
+
+with SchLib("input/library.SchLib") as lib:
+    pred = q.all_of(q.name_contains("TH_"), q.name_excludes("ETH_"))
+    summary = lib.set_parameter_where("Mount", "Through Hole", pred)
+    # summary: matched_count, updated_count, unchanged_count, created_count,
+    #          skipped_missing_count, ...
+    lib.save("output/library.SchLib")
+```
+
+`query` provides `name_contains/name_excludes/name_regex`,
+`param_equals/param_contains/param_regex/param_exists/param_missing`,
+`designator_prefix`, `pins`, and the combinators `all_of/any_of/negate`.
+
 ## Library usage
 
 ```python
@@ -247,8 +312,10 @@ altium_schlib/          the library package
     records.py          record framing + text-record parse/serialize
     schlib.py           SchLib / Component / LibraryHeader
     writer.py           compound-file writer (native Structured Storage)
+    query.py            composable component predicates for queries
 list_components.py      acceptance program (list / search / show / self-check)
 batch_add_parameter.py  batch add a parameter to all components missing it
+batch_set_parameter.py  batch set a parameter's value on components by query
 tests/test_schlib.py    pytest suite
 input/                  source .SchLib libraries
 output/                 written libraries (git-ignored)

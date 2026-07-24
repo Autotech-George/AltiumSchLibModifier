@@ -182,6 +182,12 @@ class Component:
         except ValueError:
             return 0
 
+    @property
+    def designator(self) -> str:
+        """The schematic designator text (RECORD=34), e.g. ``"R?"``; ``""`` if none."""
+        recs = self.records_of_type(34)
+        return (recs[0].get("Text") or "") if recs else ""
+
     # -- record queries ------------------------------------------------------
     def records_of_type(self, record_id: int) -> List[Record]:
         return [r for r in self.records if r.is_text and r.record_id == record_id]
@@ -198,7 +204,13 @@ class Component:
         return None
 
     def set_parameter(self, name: str, text: str) -> bool:
-        """Update an existing parameter's ``Text``. Returns True if found."""
+        """Update an existing parameter's ``Text``. Returns True if found.
+
+        The value is validated (ASCII, no ``|``/NUL) so it cannot corrupt the
+        record -- consistent with :meth:`add_parameter`.
+        """
+        text = str(text)
+        self._validate_param_field("value", text, allow_equals=True)
         for r in self.parameters:
             if r.get("Name") == name:
                 r.set("Text", text)
@@ -551,6 +563,54 @@ class SchLib:
             "added_count": len(added),
             "skipped_count": len(skipped),
             "total": len(added) + len(skipped),
+        }
+
+    def set_parameter_where(self, target: str, value: str, predicate,
+                            *, create_missing: bool = False,
+                            hidden: bool = True) -> dict:
+        """Set parameter ``target`` to ``value`` on every component matching
+        ``predicate`` (a ``Callable[[Component], bool]``).
+
+        A matched component that already has ``target`` is updated (or left as
+        ``unchanged`` if the value is identical). A matched component that lacks
+        ``target`` is created when ``create_missing`` else recorded under
+        ``skipped_missing`` and left untouched. Non-matches are untouched. Does
+        not save. Returns a summary with per-outcome name lists and counts.
+        """
+        value = str(value)
+        Component._validate_param_field("value", value, allow_equals=True)
+
+        updated: List[str] = []
+        unchanged: List[str] = []
+        created: List[str] = []
+        skipped_missing: List[str] = []
+        matched: List[str] = []
+        for comp in self.components:
+            if not predicate(comp):
+                continue
+            matched.append(comp.name)
+            if comp.has_parameter(target):
+                if comp.get_parameter(target) == value:
+                    unchanged.append(comp.name)
+                else:
+                    comp.set_parameter(target, value)
+                    updated.append(comp.name)
+            elif create_missing:
+                comp.add_parameter(target, value, hidden=hidden)
+                created.append(comp.name)
+            else:
+                skipped_missing.append(comp.name)
+        return {
+            "target": target,
+            "value": value,
+            "matched": matched,
+            "matched_count": len(matched),
+            "updated_count": len(updated),
+            "unchanged_count": len(unchanged),
+            "created_count": len(created),
+            "skipped_missing": skipped_missing,
+            "skipped_missing_count": len(skipped_missing),
+            "total": len(self.component_names),
         }
 
     # -- saving --------------------------------------------------------------
