@@ -134,8 +134,10 @@ python batch_add_parameter.py --name Mount --value "Surface Mount" --in-place
 - **Visibility**: the parameter is added hidden by default (matching a normal
   machine parameter); use `--visible` / `--hidden` to force it.
 - `--json` prints a summary (`added_count`, `skipped_count`, `total`, `output`).
-- Only the modified components' `Data` streams change; everything else stays
-  byte-identical, and re-running is idempotent.
+- Only the modified components are touched; the *record content* of every other
+  component (and all root streams) is left unchanged, and the operation is
+  idempotent at the data level. Note the saved file is **not byte-identical**
+  between runs — see [Output determinism](#output-determinism).
 - Values must currently be ASCII (Altium's `%UTF8%` dual-encoding for non-ASCII
   parameter text is not yet emitted). Saving requires `pywin32` (Windows).
 
@@ -193,9 +195,11 @@ Behaviour:
   parameter is **skipped and reported** by default; pass `--create-missing` to
   add it (hidden) instead.
 - **Safe & surgical**: writes `output/<input-name>.SchLib` (never clobbers the
-  input unless `--in-place`); only the changed components' `Data` streams differ;
-  re-running is idempotent. `--json` emits the summary. Values are ASCII-only
-  (same limitation as add); saving needs `pywin32`.
+  input unless `--in-place`); only the matched components' record content
+  changes, and it is idempotent at the data level (the saved file is not
+  byte-identical between runs — see [Output determinism](#output-determinism)).
+  `--json` emits the summary. Values are ASCII-only (same limitation as add);
+  saving needs `pywin32`.
 
 Programmatically, build a predicate with `altium_schlib.query` and apply it:
 
@@ -213,6 +217,30 @@ with SchLib("input/library.SchLib") as lib:
 `query` provides `name_contains/name_excludes/name_regex`,
 `param_equals/param_contains/param_regex/param_exists/param_missing`,
 `designator_prefix`, `pins`, and the combinators `all_of/any_of/negate`.
+
+## Output determinism
+
+Running the same command on the same input **twice produces two files that are
+functionally identical but not byte-identical** — a raw compare such as
+`fc /b out1.SchLib out2.SchLib` (Windows) or `cmp` will report differences.
+This is expected, **not** corruption; both files open identically in Altium.
+Two things vary between saves:
+
+1. **Parameter `UniqueID`s.** Altium gives every object an 8-character unique
+   ID. When a *new* parameter is created (batch-add, or batch-set with
+   `--create-missing`), the tool generates a fresh random ID for it — mirroring
+   Altium — so each run assigns different IDs to the newly-created parameters.
+   (Editing an existing parameter's value does not change its ID.)
+2. **Compound-file timestamps.** A `.SchLib` is an OLE compound file whose
+   directory entries carry timestamps; the OS Structured Storage writer stamps
+   them at save time, so even re-saving with no edits changes those bytes.
+
+Consequently, "unchanged / byte-identical / idempotent" in this README refers to
+**stream (record) content**, not the raw file. To check whether two libraries
+are *really* the same, compare their per-component record content (e.g. via the
+parser / `--json` output), not raw bytes. Deterministic, byte-reproducible
+output (fixed IDs + normalized timestamps) is not currently implemented — it can
+be added on request.
 
 ## Library usage
 
