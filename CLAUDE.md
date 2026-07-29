@@ -12,14 +12,16 @@ built on it.
 ## Commands
 
 ```bash
-python -m pytest -q                          # full suite (~30s against the sample library)
+python -m pytest -q                          # full suite (~40s against the sample library)
 python -m pytest -q -k test_name             # single test
 python -m pytest -q tests/test_schlib.py::test_lossless_save
+python -m pytest -q tests/test_liblinks.py   # relink engine/CLI (self-contained fixtures)
 
 python list_components.py                    # list + self-check (also --show/--match/selectors/--json)
 python batch_add_parameter.py --name Mount --value "Unknown" --dry-run
 python batch_set_parameter.py --set Mount="Through Hole" --name-contains TH_ --dry-run
 python font_tool.py                          # font statistics; --rename-to NAME to change
+python relink_libraries.py <ROOT> <NEW.SchLib>   # report; --apply to write
 ```
 
 Dependencies: `olefile` (read), `pywin32` (write — **Windows only**; reading/
@@ -49,6 +51,12 @@ Layering, bottom-up:
 - **`altium_schlib/query.py`** — composable `Component` predicates
   (`name_contains`, `param_equals`, `designator_prefix`, `pins`,
   `all_of/any_of/negate`) used by search and batch-set.
+- **`altium_schlib/liblinks.py`** — the only module that touches *projects*
+  rather than libraries. `.SchDoc` and `.PcbDoc` are OLE2 containers whose
+  record streams use the **same framing as `.SchLib`**, so `records.py` parses
+  them directly (verified byte-exact); the whole container is copied and only
+  the edited stream substituted. `.PrjPcb` is INI text patched with a byte-level
+  regex to preserve its BOM/CRLF. See the library-reference field map below.
 - **`cli_common.py`** — **the home for reusable CLI functionality.** Anything
   shared by two or more tools goes here, not copy-pasted: input discovery
   (`find_default_schlib`), safe output resolution (`resolve_output` — default
@@ -57,6 +65,25 @@ Layering, bottom-up:
   building (`build_predicate`), and negation parsing (`NAME!=VALUE`, `!`
   prefix, `\!` escape). When adding a new CLI tool or selector, extend this
   file so `list_components.py` and the batch tools stay in lockstep.
+
+## Where a library filename is cached (relink tool)
+
+The same library name is stored in three places; fixing one alone leaves a
+project inconsistent:
+
+| File | Stream / location | Field(s) |
+|---|---|---|
+| `.SchDoc` | `FileHeader`, `RECORD=1` | `SourceLibraryName` |
+| `.PcbDoc` | `Components6/Data` | `SOURCECOMPONENTLIBRARY`, `SOURCECOMPLIBRARYIDENTIFIER`, `SOURCEFOOTPRINTLIBRARY` |
+| `.PrjPcb` | INI cached component list | `ComponentLibraryIdentifier<N>` |
+
+**Field-name case varies between Altium versions** (`SourceLibraryName` *and*
+`SOURCELIBRARYNAME` both occur in one library) — always match field names
+case-insensitively and write back with the key's *original* casing. `Record.get`
+/ `Record.set` are case-sensitive, so look the actual key up first.
+Footprint references in `.SchDoc` model records (`RECORD=45`) are names only
+(`ModelName`), never library filenames. `RECORD=33` `Text` holds a *sheet*
+filename (`.SchDoc`) — do not mistake it for a library.
 
 ## Invariants — do not break these
 
@@ -96,9 +123,13 @@ exactly the intended streams changed, everything else byte-identical.
 
 ## Gotchas
 
-- **`.SchLib` files are proprietary and must never be committed** — gitignored
-  at any depth under `input/` and `output/`. Check `git status` before
+- **Proprietary design data must never be committed** — `.SchLib` at any depth
+  under `input/`/`output/`, and the whole `altium_test_projects/` folder (real
+  Altium projects used for manual testing). Check `git status` before
   committing; history has been scrubbed once already.
+- Tests must not depend on `altium_test_projects/` (it is gitignored and absent
+  for everyone else) — `tests/test_liblinks.py` synthesizes its own `.SchDoc`/
+  `.PcbDoc`/`.PrjPcb` fixtures instead.
 - **Output is not byte-deterministic**: newly created records get random
   UniqueIDs and the OLE writer stamps directory timestamps, so `fc /b` on two
   runs differs even though content is identical. Compare stream/record content,

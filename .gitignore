@@ -26,5 +26,8 @@ env/
 /input/**/*.SchLib
 /output/**/*.SchLib
 
+# Local Altium projects used for manual testing (proprietary designs)
+/altium_test_projects/
+
 # Claude Code runtime artifacts
 .claude/scheduled_tasks.lock

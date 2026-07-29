@@ -20,6 +20,8 @@ losslessly (only the bytes you actually changed change).
   matching a composable query (name / parameter / designator / pins) — see
   `batch_set_parameter.py`
 - ✅ **Font statistics & batch typeface change** — see `font_tool.py`
+- ✅ **Repoint whole projects off a stale/missing library** onto a new one
+  (`.SchDoc` + `.PcbDoc` + `.PrjPcb`) — see `relink_libraries.py`
 - ✅ **Atomic** save to a new `.SchLib` (temp file + rename) preserving structure
   and Altium's CLSID; in-place `save(same_path)` supported
 
@@ -293,6 +295,60 @@ scripting.
 Programmatically: `lib.fonts()`, `lib.font_usage()`,
 `lib.rename_fonts(name, only_names=..., only_ids=...)`.
 
+## Repoint stale library links (`relink_libraries.py`)
+
+When a component library is renamed or moved, every project that used it keeps
+pointing at the old filename and its components stop resolving in Altium. This
+tool scans a folder tree of projects, reports which libraries they reference and
+which of those no longer exist, and repoints the stale ones at a replacement.
+
+The filename is cached in **three** places, all of which are updated together —
+fixing only the schematic leaves the PCB and project file stale:
+
+| File | Where | Field |
+|---|---|---|
+| `.SchDoc` | component records (`RECORD=1`) | `SourceLibraryName` |
+| `.PcbDoc` | `Components6/Data` records | `SOURCECOMPONENTLIBRARY`, `SOURCECOMPLIBRARYIDENTIFIER` (or `SOURCEFOOTPRINTLIBRARY` for a `.PcbLib`) |
+| `.PrjPcb` | cached component list | `ComponentLibraryIdentifier<N>` |
+
+```bash
+# What would change? (default: reports, writes nothing)
+python relink_libraries.py C:\Projects path\to\NewLibrary.SchLib
+
+# Do it:
+python relink_libraries.py C:\Projects path\to\NewLibrary.SchLib --apply
+
+# Repoint one specific old library, whether or not it still exists:
+python relink_libraries.py C:\Projects NewLib.SchLib \
+    --from "mySCHLib 10_10_2017.SchLib" --apply
+
+# Footprint libraries work the same way:
+python relink_libraries.py C:\Projects NewFootprints.PcbLib --apply
+```
+
+- **Reports by default.** Nothing is written without `--apply`, and each
+  modified file is backed up as `<file>.bak` (`--no-backup` to skip). A `.bak`
+  from an earlier run is never overwritten, so the pristine original survives
+  repeated runs.
+- **"Stale" = not found.** A referenced library counts as existing if a file of
+  that name is found beside the new library, anywhere under the scanned root, or
+  under a `--search-path` folder; only unresolvable references are repointed.
+  `--from NAME` targets a specific library regardless, `--all-others` repoints
+  every reference that isn't already the target.
+- **Surgical:** in each binary document only the one record stream changes
+  (verified), the container's other streams and its CLSID are copied verbatim,
+  and the original field-name casing is preserved (Altium emits both
+  `SourceLibraryName` and `SOURCELIBRARYNAME`). `.PrjPcb` is patched at byte
+  level, so its BOM and CRLF endings survive.
+- **Residual check:** after writing, each file is re-scanned at byte level for
+  the old name; anything left is reported as a warning (and sets a non-zero exit
+  code) rather than passing silently.
+- Generated/archive folders (`History`, `__Previews`, `Project Outputs/Logs`)
+  are skipped. `--json` emits the full report. Writing needs `pywin32`.
+
+Programmatically, the engine is `altium_schlib.liblinks`: `scan_tree`,
+`referenced_libraries`, `classify`, `rewrite_file`, `residual_occurrences`.
+
 ## Output determinism
 
 Running the same command on the same input **twice produces two files that are
@@ -416,12 +472,14 @@ altium_schlib/          the library package
     schlib.py           SchLib / Component / LibraryHeader
     writer.py           compound-file writer (native Structured Storage)
     query.py            composable component predicates for queries
+    liblinks.py         scan/repair library references in projects
 cli_common.py           shared CLI plumbing (query selectors, output safety)
 list_components.py      acceptance program (list / search / show / self-check)
 batch_add_parameter.py  batch add a parameter to all components missing it
 batch_set_parameter.py  batch set a parameter's value on components by query
 font_tool.py            font statistics + batch typeface change
-tests/test_schlib.py    pytest suite
+relink_libraries.py     repoint projects off stale/missing libraries
+tests/                  pytest suite (test_schlib.py, test_liblinks.py)
 input/                  source .SchLib libraries
 output/                 written libraries (git-ignored)
 ```
