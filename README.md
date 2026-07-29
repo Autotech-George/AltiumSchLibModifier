@@ -330,6 +330,23 @@ python relink_libraries.py C:\Projects NewFootprints.PcbLib --apply
   modified file is backed up as `<file>.bak` (`--no-backup` to skip). A `.bak`
   from an earlier run is never overwritten, so the pristine original survives
   repeated runs.
+- **`--show-refs` lists every affected reference individually** — designator,
+  component, sheet and the exact field — so you can audit precisely what would
+  change before applying:
+
+  ```
+  Affected references (85):
+
+    Design_v1i3\ETH2YLink_v1i3.PcbDoc  —  PcbDoc, 71 refs in 71 components
+      U3        SMD_VREG_NLIN_L5973D    [06]_POWER_SUPPLY  [SOURCECOMPLIBRARYIDENTIFIER]
+      C39       SMD_CAP_NP              [09]_ETHERNET      [SOURCECOMPLIBRARYIDENTIFIER]
+    Design_v1i3\ETH2YLink_v1i3.PrjPcb  —  PrjPcb, 14 refs in 14 entries
+      entry 19  CON_PROG_ESP32_PIN_1x5_P1.9mm   [ComponentLibraryIdentifier19]
+  ```
+
+  It is not capped by `--limit`, and with `--json` the same data arrives under
+  `affected_references` (one object per reference with `library`, `field`,
+  `designator`, `component`, `context`).
 - **"Stale" = not found.** A referenced library counts as existing if a file of
   that name is found beside the new library, anywhere under the scanned root, or
   under a `--search-path` folder; only unresolvable references are repointed.

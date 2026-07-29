@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections import Counter
 
 import pytest
 
@@ -58,6 +59,10 @@ def make_schdoc(path: str, libs=(OLD, LIVE)) -> None:
         payloads.append(
             f"|RECORD=1|LibReference=PART{i}|LibraryPath=*"
             f"|{key}={lib}|UniqueID=AAAAAAA{i}\x00".encode()
+        )
+        # The designator record that follows the component it belongs to.
+        payloads.append(
+            f"|RECORD=34|OwnerIndex={i}|Text=D{i}|Name=Designator\x00".encode()
         )
     # A sheet-filename record: looks library-ish but must never be touched.
     payloads.append(b"|RECORD=33|Text=[01]_SHEET.SchDoc|Name=SheetName\x00")
@@ -372,6 +377,78 @@ def test_cli_no_backup_flag(project, tmp_path, capsys):
     cli.main([str(project), str(newlib), "--apply", "--no-backup", "--json"])
     capsys.readouterr()
     assert not any(f.endswith(".bak") for f in os.listdir(project))
+
+
+@needs_pywin32
+def test_details_identify_each_reference(project):
+    scans = ll.scan_tree(str(project), "schematic")
+    for fr in scans:
+        # one detail per counted occurrence, and they agree with the counter
+        assert len(fr.details) == sum(fr.refs.values())
+        assert Counter(d.library for d in fr.details) == fr.refs
+        for d in fr.details:
+            assert d.field                      # the real field/key name
+            assert d.component                  # part name or design item id
+        if fr.doctype == "SchDoc":
+            # designator recovered from the RECORD=34 that follows the component
+            assert {d.designator for d in fr.details} == {"D0", "D1"}
+        if fr.doctype == "PcbDoc":
+            assert {d.designator for d in fr.details} == {"R0", "R1"}
+            assert all(d.context == "" for d in fr.details)
+        if fr.doctype == "PrjPcb":
+            assert {d.component for d in fr.details} == {"PART0", "PART1"}
+            assert all(d.context.startswith("entry ") for d in fr.details)
+
+
+@needs_pywin32
+def test_details_for_filters_by_library(project):
+    scans = ll.scan_tree(str(project), "schematic")
+    fr = next(f for f in scans if f.doctype == "PrjPcb")
+    picked = fr.details_for([OLD])
+    assert picked and all(d.library == OLD for d in picked)
+    assert len(picked) == fr.refs[OLD]
+
+
+@needs_pywin32
+def test_cli_show_refs_lists_components(project, tmp_path, capsys):
+    import relink_libraries as cli
+
+    newlib = tmp_path / NEW
+    newlib.write_bytes(b"x")
+    assert cli.main([str(project), str(newlib), "--show-refs"]) == 0
+    out = capsys.readouterr().out
+    assert "Affected references" in out
+    assert "PART0" in out                     # component identified by name
+    assert "ComponentLibraryIdentifier0" in out
+    assert "SOURCECOMPLIBRARYIDENTIFIER" in out
+    # without the switch the detail block is replaced by a hint
+    assert cli.main([str(project), str(newlib)]) == 0
+    plain = capsys.readouterr().out
+    assert "Affected references" not in plain
+    assert "--show-refs" in plain
+
+
+@needs_pywin32
+def test_cli_show_refs_json(project, tmp_path, capsys):
+    import json
+
+    import relink_libraries as cli
+
+    newlib = tmp_path / NEW
+    newlib.write_bytes(b"x")
+    (tmp_path / LIVE).write_bytes(b"x")   # resolvable, so only OLD is stale
+    cli.main([str(project), str(newlib), "--show-refs", "--json"])
+    doc = json.loads(capsys.readouterr().out)
+    entries = doc["affected_references"]
+    assert entries
+    flat = [r for e in entries for r in e["references"]]
+    assert len(flat) == doc["references_planned"]
+    # only the stale library's references are listed
+    assert all(r["library"] == OLD for r in flat)
+    assert {"library", "field", "designator", "component", "context"} == set(flat[0])
+    # omitted unless asked for
+    cli.main([str(project), str(newlib), "--json"])
+    assert "affected_references" not in json.loads(capsys.readouterr().out)
 
 
 def test_cli_guards(project, tmp_path):

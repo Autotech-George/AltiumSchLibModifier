@@ -44,14 +44,71 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
-from collections import Counter
+from collections import Counter, OrderedDict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from altium_schlib import liblinks as ll  # noqa: E402
 
 DOC_TYPES = ("SchDoc", "PcbDoc", "PrjPcb")
+
+
+def _natural_key(text: str):
+    """Sort key so R2 comes before R10."""
+    parts = re.split(r"(\d+)", text)
+    return [int(p) if p.isdigit() else p.lower() for p in parts]
+
+
+def _group_details(details):
+    """Collapse per-field rows into one row per component.
+
+    A component often carries the same library in two fields (the PCB records
+    both ``SOURCECOMPONENTLIBRARY`` and ``SOURCECOMPLIBRARYIDENTIFIER``), so
+    list it once with the fields it appears in.
+    """
+    groups: "OrderedDict[tuple, dict]" = OrderedDict()
+    for d in details:
+        key = (d.designator, d.component, d.context)
+        g = groups.setdefault(key, {"designator": d.designator,
+                                    "component": d.component,
+                                    "context": d.context,
+                                    "fields": [], "refs": 0})
+        if d.field not in g["fields"]:
+            g["fields"].append(d.field)
+        g["refs"] += 1
+    return sorted(groups.values(),
+                  key=lambda g: (_natural_key(g["context"]),
+                                 _natural_key(g["designator"] or g["component"])))
+
+
+def print_reference_detail(affected, replace, root: str) -> None:
+    """List every individual reference that would be / was repointed."""
+    total = sum(len(fr.details_for(replace)) for fr in affected)
+    print(f"Affected references ({total}):")
+    print()
+    for fr in affected:
+        details = fr.details_for(replace)
+        if not details:
+            continue
+        groups = _group_details(details)
+        rel = os.path.relpath(fr.path, root)
+        if fr.doctype == "PrjPcb":
+            noun = "entry" if len(groups) == 1 else "entries"
+        else:
+            noun = "component" if len(groups) == 1 else "components"
+        print(f"  {rel}  —  {fr.doctype}, {len(details)} refs in "
+              f"{len(groups)} {noun}")
+        # Column 1 is the designator for documents, the cached entry for a
+        # project file (which records no designator).
+        for g in groups:
+            first = g["designator"] or g["context"] or "-"
+            ctx = "" if (fr.doctype == "PrjPcb" or not g["context"]) \
+                else f"  {g['context']}"
+            print(f"    {first:<9} {g['component']:<36}{ctx}"
+                  f"  [{', '.join(g['fields'])}]")
+        print()
 
 
 def _project_of(path: str, project_dirs: list[str]) -> str:
@@ -89,8 +146,13 @@ def main(argv=None) -> int:
                    help="Leave .PcbDoc files untouched.")
     p.add_argument("--skip-prjpcb", action="store_true",
                    help="Leave .PrjPcb files untouched.")
+    p.add_argument("--show-refs", action="store_true",
+                   help="List every affected reference individually "
+                        "(designator, component, field) instead of just counts. "
+                        "Not capped by --limit; combine with --json for tooling.")
     p.add_argument("--limit", type=int, default=20, metavar="N",
-                   help="Cap the per-file listing (0 = no cap). Default 20.")
+                   help="Cap the per-file summary listing (0 = no cap). "
+                        "Default 20.")
     p.add_argument("--json", action="store_true",
                    help="Emit the report/summary as JSON.")
     args = p.parse_args(argv)
@@ -181,6 +243,12 @@ def main(argv=None) -> int:
         "references_changed": changed_refs,
         "residual_files": [{"path": p, "occurrences": n} for p, n in residual],
     }
+    if args.show_refs:
+        result["affected_references"] = [
+            {"path": fr.path, "doctype": fr.doctype,
+             "references": [d.as_dict() for d in fr.details_for(replace)]}
+            for fr in affected if fr.details_for(replace)
+        ]
 
     if args.json:
         print(json.dumps(result, indent=2))
@@ -227,6 +295,12 @@ def main(argv=None) -> int:
         print(f"  ... and {len(affected) - len(shown)} more file(s) "
               f"(use --limit 0 to list all)")
     print()
+
+    if args.show_refs:
+        print_reference_detail(affected, replace, args.root)
+    else:
+        print("Add --show-refs to list the affected components individually.")
+        print()
 
     if residual:
         print("WARNING: the old name still appears in these files — it is also "

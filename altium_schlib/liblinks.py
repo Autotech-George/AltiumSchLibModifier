@@ -119,15 +119,45 @@ def index_libraries(dirs: Iterable[str]) -> Dict[str, str]:
 
 
 # -- scanning -----------------------------------------------------------------
+class RefDetail:
+    """One individual library reference, with enough context to identify it."""
+
+    __slots__ = ("library", "field", "designator", "component", "context")
+
+    def __init__(self, library: str, field: str, designator: str = "",
+                 component: str = "", context: str = ""):
+        self.library = library          # the referenced library filename
+        self.field = field              # field/key holding it (original casing)
+        self.designator = designator    # e.g. 'U3' ('' where not recorded)
+        self.component = component      # library reference / design item id
+        self.context = context          # sheet path, or the .PrjPcb key
+
+    def as_dict(self) -> dict:
+        return {"library": self.library, "field": self.field,
+                "designator": self.designator, "component": self.component,
+                "context": self.context}
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return (f"<RefDetail {self.designator or '?'} {self.component!r} "
+                f"{self.field}={self.library!r}>")
+
+
 class FileRefs:
     """Library references of one kind found in a single file."""
 
-    __slots__ = ("path", "doctype", "refs")
+    __slots__ = ("path", "doctype", "refs", "details")
 
-    def __init__(self, path: str, doctype: str, refs: Counter):
+    def __init__(self, path: str, doctype: str, refs: Counter,
+                 details: Optional[List[RefDetail]] = None):
         self.path = path
         self.doctype = doctype          # 'SchDoc' | 'PcbDoc' | 'PrjPcb'
         self.refs = refs                # library name -> occurrences
+        self.details = details or []    # one RefDetail per occurrence
+
+    def details_for(self, libraries) -> List[RefDetail]:
+        """The individual references pointing at any of ``libraries``."""
+        wanted = set(libraries)
+        return [d for d in self.details if d.library in wanted]
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<FileRefs {self.doctype} {self.path!r} {dict(self.refs)}>"
@@ -147,13 +177,43 @@ def _field_matches(record, names: frozenset):
             yield key, value
 
 
+def _designators_by_component(records) -> Dict[int, str]:
+    """Map each ``RECORD=1`` index to its designator (``RECORD=34``) text.
+
+    A designator record follows the component it belongs to, so the most recent
+    component wins. (Cross-checked against the records' own ``OwnerIndex``
+    back-references on real projects: both agree for every component.)
+    """
+    out: Dict[int, str] = {}
+    current: Optional[int] = None
+    for i, r in enumerate(records):
+        if not r.is_text:
+            continue
+        if r.record_id == 1:
+            current = i
+        elif r.record_id == 34 and current is not None and current not in out:
+            out[current] = r.get("Text") or ""
+    return out
+
+
+def _get_ci(record, name: str) -> str:
+    """Case-insensitive field lookup (Altium varies the spelling)."""
+    low = name.lower()
+    for key, value in record.fields:
+        if key.lower() == low:
+            return value
+    return ""
+
+
 def scan_document(path: str, kind: str) -> Optional[FileRefs]:
     """Collect library references of ``kind`` from a ``.SchDoc``/``.PcbDoc``."""
     ext = os.path.splitext(path)[1].lower()
     names = FIELDS[kind].get(ext, frozenset())
     if not names:
         return None
+    is_sch = ext == ".schdoc"
     refs: Counter = Counter()
+    details: List[RefDetail] = []
     try:
         ole = olefile.OleFileIO(path)
     except Exception:
@@ -164,21 +224,49 @@ def scan_document(path: str, kind: str) -> Optional[FileRefs]:
                 records = parse_records(data)
             except ValueError:
                 continue
-            for r in records:
+            designators = _designators_by_component(records) if is_sch else {}
+            for i, r in enumerate(records):
                 if not r.is_text:
                     continue
-                for _key, value in _field_matches(r, names):
+                matches = list(_field_matches(r, names))
+                if not matches:
+                    continue
+                if is_sch:
+                    designator = designators.get(i, "")
+                    component = (_get_ci(r, "LibReference")
+                                 or _get_ci(r, "DesignItemId"))
+                    context = ""
+                else:
+                    designator = _get_ci(r, "SOURCEDESIGNATOR")
+                    component = (_get_ci(r, "SOURCELIBREFERENCE")
+                                 or _get_ci(r, "PATTERN"))
+                    context = _get_ci(r, "SOURCEHIERARCHICALPATH")
+                for key, value in matches:
                     if value:
                         refs[value] += 1
+                        details.append(RefDetail(value, key, designator,
+                                                 component, context))
     finally:
         ole.close()
-    return FileRefs(path, "SchDoc" if ext == ".schdoc" else "PcbDoc", refs)
+    return FileRefs(path, "SchDoc" if is_sch else "PcbDoc", refs, details)
 
 
 def _prj_pattern(key: str, old: Optional[str] = None) -> re.Pattern:
     value = re.escape(old.encode("utf-8")) if old is not None else rb"[^\r\n]*"
     return re.compile(
         rb"(?mi)^(" + key.encode() + rb"\d*=)(" + value + rb")(?=\r|\n|$)")
+
+
+def _prj_component_fields(raw: bytes) -> Dict[str, Dict[str, str]]:
+    """Parse ``Component<Field><N>=value`` lines into ``{N: {field: value}}``."""
+    out: Dict[str, Dict[str, str]] = {}
+    pattern = re.compile(rb"(?mi)^Component([A-Za-z]+)(\d+)=([^\r\n]*)")
+    for m in pattern.finditer(raw):
+        field = m.group(1).decode()
+        index = m.group(2).decode()
+        value = m.group(3).decode("utf-8", "replace").strip()
+        out.setdefault(index, {})[field.lower()] = value
+    return out
 
 
 def scan_project(path: str, kind: str) -> Optional[FileRefs]:
@@ -192,11 +280,24 @@ def scan_project(path: str, kind: str) -> Optional[FileRefs]:
     except OSError:
         return None
     refs: Counter = Counter()
+    details: List[RefDetail] = []
+    entries = _prj_component_fields(raw)
+    # Strip the trailing index off the key to look the entry's siblings up.
+    field_stem = key
     for m in _prj_pattern(key).finditer(raw):
         value = m.group(2).decode("utf-8", "replace").strip()
-        if value:
-            refs[value] += 1
-    return FileRefs(path, "PrjPcb", refs)
+        if not value:
+            continue
+        full_key = m.group(1).decode().rstrip("=")
+        index = full_key[len(field_stem):]
+        entry = entries.get(index, {})
+        refs[value] += 1
+        details.append(RefDetail(
+            value, full_key, designator="",
+            component=(entry.get("designitemid")
+                       or entry.get("symbolreference", "")),
+            context=f"entry {index}"))
+    return FileRefs(path, "PrjPcb", refs, details)
 
 
 def scan_tree(root: str, kind: str, *, doc_types=("SchDoc", "PcbDoc", "PrjPcb")
